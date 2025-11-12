@@ -1,0 +1,1279 @@
+"""
+Eden Transcription Plugin - Part 1
+Real-time speech-to-text with PHI detection and reactive redaction.
+Core classes and PHI detection system.
+
+File: src/plugins/transcription/plugin.py
+"""
+
+import time
+import logging
+import threading
+import queue
+import re
+from typing import Dict, List, Optional, Any, Callable
+from dataclasses import dataclass, field
+import numpy as np
+import torch
+import whisper
+from datetime import datetime
+
+from src.core.audio_recorder import AudioChunk, PluginInterface
+
+
+@dataclass
+class TranscriptionConfig:
+    """Configuration for transcription plugin"""
+    enabled: bool = True
+    model_size: str = "small"  # tiny, small, base, large
+    device: str = "cuda"  # cuda or cpu
+    language: str = "en"
+    
+    # Processing settings
+    buffer_seconds: float = 1.0
+    overlap_seconds: float = 0.2
+    confidence_threshold: float = 0.7
+    
+    # PHI detection
+    phi_detection: str = "strict"  # strict, moderate, loose
+    redaction_char: str = "#"
+    
+    # Real-time settings
+    marquee_speed: float = 2.0  # characters per second
+    redaction_delay: float = 0.5  # seconds before redaction kicks in
+
+
+@dataclass
+class TranscriptChunk:
+    """Individual transcript chunk with metadata"""
+    chunk_id: int
+    session_id: str
+    speaker_id: str
+    text: str
+    confidence: float
+    start_time: float
+    end_time: float
+    is_final: bool = True
+    redaction_status: str = "active"  # active, redacting, redacted
+    original_text: str = ""  # Store original before redaction
+    phi_detected: List[str] = field(default_factory=list)
+    
+    def to_dict(self) -> dict:
+        return {
+            'chunk_id': self.chunk_id,
+            'session_id': self.session_id,
+            'speaker_id': self.speaker_id,
+            'text': self.text,
+            'confidence': self.confidence,
+            'start_time': self.start_time,
+            'end_time': self.end_time,
+            'is_final': self.is_final,
+            'redaction_status': self.redaction_status,
+            'phi_detected': self.phi_detected
+        }
+
+
+class PHIDetector:
+    """Detects Personal Health Information and other sensitive data"""
+    
+    def __init__(self, sensitivity: str = "strict"):
+        self.sensitivity = sensitivity
+        self.logger = logging.getLogger(__name__)
+        
+        # PHI patterns (strict mode - comprehensive)
+        self.patterns = {
+            # Medical conditions and symptoms
+            'medical_conditions': [
+                r'\b(?:diabetes|cancer|depression|anxiety|HIV|AIDS|hepatitis|asthma|COPD|hypertension|heart disease|stroke|seizure|epilepsy|alzheimer|dementia|schizophrenia|bipolar|PTSD|addiction|overdose|pregnant|pregnancy|miscarriage|abortion)\b',
+                r'\b(?:pain|ache|hurt|sore|bleeding|fever|nausea|vomiting|diarrhea|constipation|fatigue|weakness|dizzy|headache|migraine|rash|infection|injury|fracture|surgery|operation|procedure)\b',
+                r'\b(?:medication|prescription|pill|tablet|injection|therapy|treatment|diagnosis|symptom|condition|illness|disease|disorder|syndrome)\b'
+            ],
+            
+            # Personal identifiers  
+            'personal_identifiers': [
+                r'\b\d{3}-\d{2}-\d{4}\b',  # SSN
+                r'\b\d{3}-\d{3}-\d{4}\b',  # Phone
+                r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',  # Email
+                r'\b\d{1,5}\s+\w+\s+(?:street|st|avenue|ave|road|rd|drive|dr|lane|ln|court|ct|circle|cir|boulevard|blvd)\b',  # Address
+                r'\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2},?\s+\d{4}\b',  # Dates
+                r'\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b'  # Date formats
+            ],
+            
+            # Names (common patterns)
+            'names': [
+                r'\bmy name is\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b',
+                r'\bI\'?m\s+([A-Z][a-z]+)\b',
+                r'\bcall me\s+([A-Z][a-z]+)\b',
+                r'\bDr\.?\s+([A-Z][a-z]+)\b',
+                r'\bMr\.?\s+([A-Z][a-z]+)\b',
+                r'\bMrs\.?\s+([A-Z][a-z]+)\b',
+                r'\bMs\.?\s+([A-Z][a-z]+)\b'
+            ],
+            
+            # Medical professionals and facilities
+            'medical_entities': [
+                r'\b(?:doctor|physician|nurse|therapist|psychiatrist|psychologist|dentist|surgeon|specialist|consultant)\s+[A-Z][a-z]+\b',
+                r'\b[A-Z][a-z]+\s+(?:hospital|clinic|medical center|health center|emergency room|ER|ICU|urgent care)\b',
+                r'\b(?:insurance|medicare|medicaid|blue cross|aetna|cigna|humana|kaiser|anthem)\b'
+            ],
+            
+            # Medications and treatments
+            'medications': [
+                r'\b(?:advil|tylenol|aspirin|ibuprofen|acetaminophen|morphine|oxycodone|hydrocodone|adderall|ritalin|xanax|valium|prozac|zoloft|lexapro|lipitor|metformin|insulin|penicillin|amoxicillin|prednisone|albuterol|lisinopril|atorvastatin|metoprolol|amlodipine|omeprazole|losartan|simvastatin|levothyroxine|azithromycin|gabapentin|hydrochlorothiazide|sertraline|fluoxetine|citalopram|trazodone|cyclobenzaprine|tramadol|naproxen|meloxicam)\b',
+                r'\b\d+\s*mg\b',  # Dosages
+                r'\btake\s+\d+\s+(?:pill|tablet|capsule|dose)s?\b',
+                r'\b(?:twice|once|three times)\s+(?:a day|daily|per day)\b'
+            ]
+        }
+        
+        # Compile patterns for performance
+        self.compiled_patterns = {}
+        for category, pattern_list in self.patterns.items():
+            self.compiled_patterns[category] = [
+                re.compile(pattern, re.IGNORECASE) for pattern in pattern_list
+            ]
+    
+    def detect_phi(self, text: str) -> List[Dict[str, Any]]:
+        """
+        Detect PHI in text and return list of detected items
+        Returns: List of {category, text, start, end, confidence}
+        """
+        detected_phi = []
+        
+        for category, patterns in self.compiled_patterns.items():
+            for pattern in patterns:
+                matches = pattern.finditer(text)
+                for match in matches:
+                    detected_phi.append({
+                        'category': category,
+                        'text': match.group(),
+                        'start': match.start(),
+                        'end': match.end(),
+                        'confidence': self._calculate_confidence(category, match.group())
+                    })
+        
+        # Remove duplicates and overlaps
+        detected_phi = self._remove_overlaps(detected_phi)
+        
+        return detected_phi
+    
+    def _calculate_confidence(self, category: str, text: str) -> float:
+        """Calculate confidence score for PHI detection"""
+        # Base confidence by category
+        base_confidence = {
+            'personal_identifiers': 0.95,  # SSN, phone, email are very reliable
+            'medical_conditions': 0.85,    # Medical terms are pretty reliable
+            'names': 0.75,                 # Names can be tricky
+            'medical_entities': 0.90,      # Dr. Smith, hospitals are reliable
+            'medications': 0.95             # Drug names are very specific
+        }
+        
+        confidence = base_confidence.get(category, 0.8)
+        
+        # Adjust based on context
+        if category == 'names' and len(text) < 3:
+            confidence *= 0.5  # Short names less reliable
+        
+        if category == 'medical_conditions' and text.lower() in ['pain', 'hurt', 'sore']:
+            confidence *= 0.7  # Common words, less specific
+        
+        return min(confidence, 0.98)  # Cap at 98%
+    
+    def _remove_overlaps(self, phi_list: List[Dict]) -> List[Dict]:
+        """Remove overlapping PHI detections, keeping highest confidence"""
+        if not phi_list:
+            return []
+        
+        # Sort by start position
+        phi_list.sort(key=lambda x: x['start'])
+        
+        filtered = []
+        for current in phi_list:
+            # Check if overlaps with any in filtered list
+            overlaps = False
+            for existing in filtered:
+                if (current['start'] < existing['end'] and 
+                    current['end'] > existing['start']):
+                    # Overlaps - keep the one with higher confidence
+                    if current['confidence'] > existing['confidence']:
+                        filtered.remove(existing)
+                        filtered.append(current)
+                    overlaps = True
+                    break
+            
+            if not overlaps:
+                filtered.append(current)
+        
+        return sorted(filtered, key=lambda x: x['start'])
+    
+    def redact_text(self, text: str, phi_detections: List[Dict], 
+                   redaction_char: str = "#") -> str:
+        """Replace detected PHI with redaction characters"""
+        if not phi_detections:
+            return text
+        
+        # Work backwards to maintain string positions
+        redacted_text = text
+        for phi in reversed(phi_detections):
+            start, end = phi['start'], phi['end']
+            original_length = end - start
+            replacement = redaction_char * original_length
+            redacted_text = redacted_text[:start] + replacement + redacted_text[end:]
+        
+        return redacted_text
+    
+    def get_redaction_summary(self, phi_detections: List[Dict]) -> Dict[str, int]:
+        """Get summary of what was redacted"""
+        summary = {}
+        for phi in phi_detections:
+            category = phi['category']
+            summary[category] = summary.get(category, 0) + 1
+        return summary
+
+
+class AudioBuffer:
+    """Manages audio buffering for optimal Whisper processing"""
+    
+    def __init__(self, buffer_seconds: float = 1.0, overlap_seconds: float = 0.2, 
+                 sample_rate: int = 16000):
+        self.buffer_seconds = buffer_seconds
+        self.overlap_seconds = overlap_seconds
+        self.sample_rate = sample_rate
+        
+        self.buffer_size = int(buffer_seconds * sample_rate)
+        self.overlap_size = int(overlap_seconds * sample_rate)
+        
+        self.audio_buffer = np.array([], dtype=np.float32)
+        self.chunk_counter = 0
+        self.last_processed_time = 0
+        
+        self.lock = threading.Lock()
+        self.logger = logging.getLogger(__name__)
+    
+    def add_audio(self, audio_data: np.ndarray, timestamp: float) -> bool:
+        """
+        Add audio data to buffer
+        Returns True if buffer is ready for processing
+        """
+        with self.lock:
+            # Append new audio data
+            self.audio_buffer = np.concatenate([self.audio_buffer, audio_data])
+            
+            # Check if we have enough audio for processing
+            if len(self.audio_buffer) >= self.buffer_size:
+                return True
+            
+            return False
+    
+    def get_audio_for_processing(self) -> tuple[np.ndarray, float]:
+        """
+        Get audio chunk for Whisper processing
+        Returns: (audio_array, timestamp)
+        """
+        with self.lock:
+            if len(self.audio_buffer) < self.buffer_size:
+                return np.array([]), 0.0
+            
+            # Extract processing chunk
+            process_chunk = self.audio_buffer[:self.buffer_size].copy()
+            
+            # Keep overlap for next iteration
+            if len(self.audio_buffer) > self.overlap_size:
+                self.audio_buffer = self.audio_buffer[self.buffer_size - self.overlap_size:]
+            else:
+                self.audio_buffer = np.array([], dtype=np.float32)
+            
+            timestamp = time.time()
+            self.chunk_counter += 1
+            
+            return process_chunk, timestamp
+    
+    def clear_buffer(self):
+        """Clear the audio buffer"""
+        with self.lock:
+            self.audio_buffer = np.array([], dtype=np.float32)
+            self.chunk_counter = 0
+    
+    def get_buffer_status(self) -> Dict[str, Any]:
+        """Get current buffer status"""
+        with self.lock:
+            return {
+                'buffer_length': len(self.audio_buffer),
+                'buffer_seconds': len(self.audio_buffer) / self.sample_rate,
+                'chunks_processed': self.chunk_counter,
+                'ready_for_processing': len(self.audio_buffer) >= self.buffer_size
+            }
+
+
+class WhisperEngine:
+    """Whisper speech recognition engine"""
+    
+    def __init__(self, model_size: str = "small", device: str = "cuda", language: str = "en"):
+        self.model_size = model_size
+        self.device = device if torch.cuda.is_available() else "cpu"
+        self.language = language
+        
+        self.model = None
+        self.logger = logging.getLogger(__name__)
+        
+        # Load model
+        self._load_model()
+    
+    def _load_model(self):
+        """Load Whisper model"""
+        try:
+            self.logger.info(f"Loading Whisper model: {self.model_size} on {self.device}")
+            self.model = whisper.load_model(self.model_size, device=self.device)
+            self.logger.info("Whisper model loaded successfully")
+        except Exception as e:
+            self.logger.error(f"Failed to load Whisper model: {e}")
+            raise
+    
+    def transcribe_audio(self, audio_data: np.ndarray, language: str = None) -> Dict[str, Any]:
+        """
+        Transcribe audio using Whisper
+        Returns: {text, confidence, language, segments}
+        """
+        if self.model is None:
+            return {'text': '', 'confidence': 0.0, 'language': 'en', 'segments': []}
+        
+        try:
+            # Ensure audio is the right format for Whisper
+            if len(audio_data) == 0:
+                return {'text': '', 'confidence': 0.0, 'language': 'en', 'segments': []}
+            
+            # Whisper expects audio to be 30 seconds max, we're doing 1-2 second chunks
+            # Pad if too short
+            if len(audio_data) < 16000:  # Less than 1 second
+                audio_data = np.pad(audio_data, (0, 16000 - len(audio_data)))
+            
+            # Transcribe
+            result = self.model.transcribe(
+                audio_data,
+                language=language or self.language,
+                task='transcribe',
+                fp16=torch.cuda.is_available(),
+                verbose=False
+            )
+            
+            # Extract confidence from segments
+            confidence = 0.0
+            if 'segments' in result and result['segments']:
+                # Average confidence from all segments
+                confidences = []
+                for segment in result['segments']:
+                    if 'avg_logprob' in segment:
+                        # Convert log probability to confidence
+                        conf = np.exp(segment['avg_logprob'])
+                        confidences.append(conf)
+                
+                if confidences:
+                    confidence = np.mean(confidences)
+                else:
+                    confidence = 0.8  # Default confidence if not available
+            
+            return {
+                'text': result.get('text', '').strip(),
+                'confidence': float(confidence),
+                'language': result.get('language', 'en'),
+                'segments': result.get('segments', [])
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Whisper transcription error: {e}")
+            return {'text': '', 'confidence': 0.0, 'language': 'en', 'segments': []}
+class TranscriptionPlugin:
+    """Main transcription plugin with real-time PHI detection and redaction"""
+    
+    def __init__(self, config: TranscriptionConfig, storage_plugin=None):
+        self.config = config
+        self.storage_plugin = storage_plugin
+        self._enabled = config.enabled
+        
+        # Core components
+        self.whisper_engine = None
+        self.phi_detector = PHIDetector(config.phi_detection)
+        self.audio_buffers: Dict[str, AudioBuffer] = {}  # Per speaker
+        
+        # Current session tracking
+        self.current_session: Optional[str] = None
+        self.transcript_chunks: List[TranscriptChunk] = []
+        self.chunk_counter = 0
+        
+        # Real-time processing
+        self.processing_queue = queue.Queue()
+        self.processing_thread = None
+        self.running = threading.Event()
+        
+        # Redaction tracking
+        self.redaction_queue = queue.Queue()
+        self.redaction_thread = None
+        self.speaker_consent_status: Dict[str, str] = {}  # speaker_id -> status
+        
+        # Callbacks for marquee integration
+        self.callbacks: Dict[str, List[Callable]] = {
+            'new_transcript': [],      # New text ready for marquee
+            'redaction_update': [],    # Text needs to be redacted
+            'speaker_muted': [],       # Speaker completely muted
+            'processing_error': []     # Error in processing
+        }
+        
+        self.logger = logging.getLogger(__name__)
+        
+        # Initialize Whisper (lazy loading)
+        if self.enabled:
+            self._initialize_whisper()
+    
+    @property
+    def name(self) -> str:
+        return "TranscriptionPlugin"
+    
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+    
+    def _initialize_whisper(self):
+        """Initialize Whisper engine (can be slow, so done once)"""
+        try:
+            self.whisper_engine = WhisperEngine(
+                model_size=self.config.model_size,
+                device=self.config.device,
+                language=self.config.language
+            )
+            self.logger.info("Whisper engine initialized successfully")
+        except Exception as e:
+            self.logger.error(f"Failed to initialize Whisper: {e}")
+            self._enabled = False
+    
+    def process_audio(self, chunk: AudioChunk) -> Optional[AudioChunk]:
+        """Process audio chunk for transcription (transparent to other plugins)"""
+        if not self.enabled or not self.whisper_engine or not self.current_session:
+            return chunk
+        
+        try:
+            # Check if speaker consent is active
+            if chunk.speaker_id and not self._is_speaker_active(chunk.speaker_id):
+                return chunk  # Skip processing for muted speakers
+            
+            # Get or create audio buffer for this speaker
+            if chunk.speaker_id not in self.audio_buffers:
+                self.audio_buffers[chunk.speaker_id] = AudioBuffer(
+                    self.config.buffer_seconds,
+                    self.config.overlap_seconds,
+                    chunk.sample_rate
+                )
+            
+            buffer = self.audio_buffers[chunk.speaker_id]
+            
+            # Add audio to buffer
+            if buffer.add_audio(chunk.data, chunk.timestamp):
+                # Buffer is ready for processing
+                self._queue_transcription(chunk.speaker_id, chunk.session_id, chunk.consent_token)
+            
+        except Exception as e:
+            self.logger.error(f"Error processing audio chunk: {e}")
+        
+        # Return chunk unchanged (transparent operation)
+        return chunk
+    
+    def on_recording_started(self, session_id: str) -> None:
+        """Initialize transcription for new session"""
+        try:
+            self.logger.info(f"Starting transcription for session: {session_id}")
+            
+            self.current_session = session_id
+            self.transcript_chunks.clear()
+            self.chunk_counter = 0
+            self.audio_buffers.clear()
+            self.speaker_consent_status.clear()
+            
+            # Start processing threads
+            self.running.set()
+            
+            self.processing_thread = threading.Thread(
+                target=self._transcription_worker,
+                daemon=True,
+                name="TranscriptionWorker"
+            )
+            self.processing_thread.start()
+            
+            self.redaction_thread = threading.Thread(
+                target=self._redaction_worker,
+                daemon=True,
+                name="RedactionWorker"
+            )
+            self.redaction_thread.start()
+            
+            self.logger.info("Transcription processing started")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to start transcription: {e}")
+    
+    def on_recording_stopped(self, session_id: str) -> None:
+        """Finalize transcription for completed session"""
+        try:
+            self.logger.info(f"Stopping transcription for session: {session_id}")
+            
+            # Process any remaining audio in buffers
+            self._process_remaining_buffers()
+            
+            # Stop processing threads
+            self.running.clear()
+            
+            if self.processing_thread and self.processing_thread.is_alive():
+                self.processing_thread.join(timeout=3.0)
+            
+            if self.redaction_thread and self.redaction_thread.is_alive():
+                self.redaction_thread.join(timeout=2.0)
+            
+            # Save final transcript summary
+            if self.storage_plugin:
+                self._save_session_summary()
+            
+            self.current_session = None
+            
+        except Exception as e:
+            self.logger.error(f"Failed to stop transcription: {e}")
+    
+    def on_speaker_detected(self, speaker_id: str, session_id: str) -> None:
+        """Handle new speaker detection"""
+        if not self.enabled:
+            return
+        
+        try:
+            # Initialize speaker as active
+            self.speaker_consent_status[speaker_id] = "active"
+            
+            # Create audio buffer for new speaker
+            if speaker_id not in self.audio_buffers:
+                self.audio_buffers[speaker_id] = AudioBuffer(
+                    self.config.buffer_seconds,
+                    self.config.overlap_seconds,
+                    16000  # Default sample rate
+                )
+            
+            self.logger.info(f"Speaker {speaker_id} initialized for transcription")
+            
+        except Exception as e:
+            self.logger.error(f"Error handling speaker detection: {e}")
+    
+    def on_consent_revoked(self, speaker_id: str, token_id: str) -> None:
+        """Handle consent revocation - redact all speaker text"""
+        if not self.enabled:
+            return
+        
+        try:
+            self.logger.warning(f"Consent revoked for speaker {speaker_id}, initiating redaction")
+            
+            # Mark speaker as muted
+            self.speaker_consent_status[speaker_id] = "revoked"
+            
+            # Queue redaction of all existing text for this speaker
+            self.redaction_queue.put({
+                'type': 'speaker_revocation',
+                'speaker_id': speaker_id,
+                'token_id': token_id,
+                'timestamp': time.time()
+            })
+            
+            # Notify marquee to redact this speaker
+            self._trigger_callback('speaker_muted', {
+                'speaker_id': speaker_id,
+                'redaction_type': 'consent_revoked'
+            })
+            
+        except Exception as e:
+            self.logger.error(f"Error handling consent revocation: {e}")
+    
+    def _queue_transcription(self, speaker_id: str, session_id: str, consent_token: str):
+        """Queue audio for transcription processing"""
+        try:
+            self.processing_queue.put({
+                'speaker_id': speaker_id,
+                'session_id': session_id,
+                'consent_token': consent_token,
+                'timestamp': time.time()
+            }, block=False)
+        except queue.Full:
+            self.logger.warning("Transcription queue full, dropping audio chunk")
+    
+    def _transcription_worker(self):
+        """Background worker for Whisper transcription"""
+        while self.running.is_set():
+            try:
+                # Get transcription task
+                try:
+                    task = self.processing_queue.get(timeout=1.0)
+                except queue.Empty:
+                    continue
+                
+                speaker_id = task['speaker_id']
+                
+                # Check if speaker is still active
+                if not self._is_speaker_active(speaker_id):
+                    continue
+                
+                # Get audio from buffer
+                if speaker_id in self.audio_buffers:
+                    audio_data, timestamp = self.audio_buffers[speaker_id].get_audio_for_processing()
+                    
+                    if len(audio_data) > 0:
+                        # Transcribe with Whisper
+                        result = self.whisper_engine.transcribe_audio(audio_data)
+                        
+                        if result['text'] and result['confidence'] >= self.config.confidence_threshold:
+                            # Create transcript chunk
+                            chunk = self._create_transcript_chunk(
+                                task['session_id'],
+                                speaker_id,
+                                result['text'],
+                                result['confidence'],
+                                timestamp,
+                                task['consent_token']
+                            )
+                            
+                            # Process for PHI detection and redaction
+                            self._process_transcript_chunk(chunk)
+                
+                self.processing_queue.task_done()
+                
+            except Exception as e:
+                self.logger.error(f"Transcription worker error: {e}")
+                time.sleep(0.1)
+    
+    def _redaction_worker(self):
+        """Background worker for handling redaction events"""
+        while self.running.is_set():
+            try:
+                # Get redaction task
+                try:
+                    task = self.redaction_queue.get(timeout=1.0)
+                except queue.Empty:
+                    continue
+                
+                if task['type'] == 'speaker_revocation':
+                    self._redact_speaker_text(task['speaker_id'])
+                elif task['type'] == 'phi_detection':
+                    self._redact_phi_in_chunk(task['chunk_id'], task['phi_detections'])
+                
+                self.redaction_queue.task_done()
+                
+            except Exception as e:
+                self.logger.error(f"Redaction worker error: {e}")
+                time.sleep(0.1)
+    
+    def _create_transcript_chunk(self, session_id: str, speaker_id: str, text: str,
+                               confidence: float, timestamp: float, consent_token: str) -> TranscriptChunk:
+        """Create a new transcript chunk"""
+        self.chunk_counter += 1
+        
+        chunk = TranscriptChunk(
+            chunk_id=self.chunk_counter,
+            session_id=session_id,
+            speaker_id=speaker_id,
+            text=text,
+            confidence=confidence,
+            start_time=timestamp,
+            end_time=timestamp + self.config.buffer_seconds,
+            original_text=text  # Store original before any redaction
+        )
+        
+        return chunk
+    
+    def _process_transcript_chunk(self, chunk: TranscriptChunk):
+        """Process transcript chunk for PHI detection and storage"""
+        try:
+            # Detect PHI in the text
+            phi_detections = self.phi_detector.detect_phi(chunk.text)
+            
+            if phi_detections:
+                # Store PHI detection info
+                chunk.phi_detected = [phi['category'] for phi in phi_detections]
+                
+                # Queue for redaction (reactive approach)
+                self.redaction_queue.put({
+                    'type': 'phi_detection',
+                    'chunk_id': chunk.chunk_id,
+                    'phi_detections': phi_detections,
+                    'delay': self.config.redaction_delay
+                })
+            
+            # Add to transcript list
+            self.transcript_chunks.append(chunk)
+            
+            # Save to database if storage plugin available
+            if self.storage_plugin:
+                self.storage_plugin.save_transcript(
+                    chunk.chunk_id,
+                    chunk.session_id,
+                    chunk.speaker_id,
+                    chunk.text,
+                    chunk.confidence,
+                    chunk.start_time
+                )
+            
+            # Send to marquee for display
+            self._trigger_callback('new_transcript', chunk.to_dict())
+            
+            self.logger.debug(f"Processed transcript chunk: {chunk.text[:50]}...")
+            
+        except Exception as e:
+            self.logger.error(f"Error processing transcript chunk: {e}")
+    
+    def _redact_speaker_text(self, speaker_id: str):
+        """Redact all text for a specific speaker"""
+        try:
+            redacted_chunks = []
+            
+            for chunk in self.transcript_chunks:
+                if chunk.speaker_id == speaker_id and chunk.redaction_status == "active":
+                    # Redact the entire text
+                    chunk.text = self.config.redaction_char * len(chunk.original_text)
+                    chunk.redaction_status = "redacted"
+                    redacted_chunks.append(chunk)
+            
+            # Notify marquee of redaction
+            for chunk in redacted_chunks:
+                self._trigger_callback('redaction_update', {
+                    'chunk_id': chunk.chunk_id,
+                    'redacted_text': chunk.text,
+                    'redaction_type': 'speaker_revocation'
+                })
+            
+            self.logger.info(f"Redacted {len(redacted_chunks)} chunks for speaker {speaker_id}")
+            
+        except Exception as e:
+            self.logger.error(f"Error redacting speaker text: {e}")
+    
+    def _redact_phi_in_chunk(self, chunk_id: int, phi_detections: List[Dict]):
+        """Redact PHI in a specific chunk"""
+        try:
+            # Add delay before redaction (reactive approach)
+            time.sleep(self.config.redaction_delay)
+            
+            # Find the chunk
+            chunk = None
+            for c in self.transcript_chunks:
+                if c.chunk_id == chunk_id:
+                    chunk = c
+                    break
+            
+            if not chunk or chunk.redaction_status != "active":
+                return
+            
+            # Apply PHI redaction
+            original_text = chunk.text
+            chunk.text = self.phi_detector.redact_text(
+                chunk.text, 
+                phi_detections, 
+                self.config.redaction_char
+            )
+            
+            if chunk.text != original_text:
+                chunk.redaction_status = "redacted"
+                
+                # Notify marquee of redaction
+                self._trigger_callback('redaction_update', {
+                    'chunk_id': chunk.chunk_id,
+                    'redacted_text': chunk.text,
+                    'redaction_type': 'phi_detection',
+                    'phi_categories': [phi['category'] for phi in phi_detections]
+                })
+                
+                self.logger.info(f"Redacted PHI in chunk {chunk_id}")
+            
+        except Exception as e:
+            self.logger.error(f"Error redacting PHI in chunk: {e}")
+    
+    def _is_speaker_active(self, speaker_id: str) -> bool:
+        """Check if speaker consent is still active"""
+        return self.speaker_consent_status.get(speaker_id, "active") == "active"
+    
+    def _process_remaining_buffers(self):
+        """Process any remaining audio in buffers before shutdown"""
+        try:
+            for speaker_id, buffer in self.audio_buffers.items():
+                if not self._is_speaker_active(speaker_id):
+                    continue
+                
+                # Get any remaining audio
+                audio_data, timestamp = buffer.get_audio_for_processing()
+                if len(audio_data) > 0:
+                    # Quick transcription for remaining audio
+                    result = self.whisper_engine.transcribe_audio(audio_data)
+                    if result['text']:
+                        chunk = self._create_transcript_chunk(
+                            self.current_session,
+                            speaker_id,
+                            result['text'],
+                            result['confidence'],
+                            timestamp,
+                            "session_end"
+                        )
+                        self._process_transcript_chunk(chunk)
+        
+        except Exception as e:
+            self.logger.error(f"Error processing remaining buffers: {e}")
+    
+    def _save_session_summary(self):
+        """Save session transcription summary"""
+        try:
+            if not self.storage_plugin:
+                return
+            
+            # Create summary
+            summary = {
+                'session_id': self.current_session,
+                'total_chunks': len(self.transcript_chunks),
+                'speakers': list(set(chunk.speaker_id for chunk in self.transcript_chunks)),
+                'total_words': sum(len(chunk.original_text.split()) for chunk in self.transcript_chunks),
+                'redacted_chunks': len([c for c in self.transcript_chunks if c.redaction_status == "redacted"]),
+                'phi_detections': sum(len(c.phi_detected) for c in self.transcript_chunks),
+                'avg_confidence': np.mean([c.confidence for c in self.transcript_chunks]) if self.transcript_chunks else 0.0
+            }
+            
+            self.logger.info(f"Session summary: {summary}")
+            
+        except Exception as e:
+            self.logger.error(f"Error saving session summary: {e}")
+    
+    def add_callback(self, event_type: str, callback: Callable):
+        """Add callback for marquee integration"""
+        if event_type in self.callbacks:
+            self.callbacks[event_type].append(callback)
+    
+    def remove_callback(self, event_type: str, callback: Callable):
+        """Remove callback"""
+        if event_type in self.callbacks and callback in self.callbacks[event_type]:
+            self.callbacks[event_type].remove(callback)
+    
+    def _trigger_callback(self, event_type: str, data: Any):
+        """Trigger callbacks for marquee updates"""
+        for callback in self.callbacks.get(event_type, []):
+            try:
+                callback(data)
+            except Exception as e:
+                self.logger.error(f"Callback error for {event_type}: {e}")
+    
+    def get_transcription_statistics(self) -> Dict[str, Any]:
+        """Get current transcription statistics"""
+        try:
+            active_speakers = len([s for s, status in self.speaker_consent_status.items() if status == "active"])
+            
+            return {
+                'session_id': self.current_session,
+                'total_chunks': len(self.transcript_chunks),
+                'active_speakers': active_speakers,
+                'processing_queue_size': self.processing_queue.qsize(),
+                'redaction_queue_size': self.redaction_queue.qsize(),
+                'buffer_status': {
+                    speaker_id: buffer.get_buffer_status() 
+                    for speaker_id, buffer in self.audio_buffers.items()
+                },
+                'recent_activity': {
+                    'chunks_last_minute': len([
+                        c for c in self.transcript_chunks 
+                        if c.start_time > time.time() - 60
+                    ])
+                }
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error getting transcription statistics: {e}")
+            return {}
+    
+    def cleanup(self) -> None:
+        """Clean up transcription plugin resources"""
+        self.running.clear()
+        
+        if self.processing_thread and self.processing_thread.is_alive():
+            self.processing_thread.join(timeout=3.0)
+        
+        if self.redaction_thread and self.redaction_thread.is_alive():
+            self.redaction_thread.join(timeout=2.0)
+        
+        # Clear buffers
+        for buffer in self.audio_buffers.values():
+            buffer.clear_buffer()
+        
+        self.audio_buffers.clear()
+        self.transcript_chunks.clear()
+        
+        self.logger.info("Transcription plugin cleaned up")
+# Factory functions and utility methods
+
+def create_transcription_plugin(config_path: str = "config/plugins_config.yaml",
+                               storage_plugin=None) -> TranscriptionPlugin:
+    """Create transcription plugin with configuration"""
+    try:
+        import yaml
+        with open(config_path, 'r') as f:
+            config_dict = yaml.safe_load(f)
+        
+        transcription_dict = config_dict.get('plugins', {}).get('transcription', {})
+        config = TranscriptionConfig(**transcription_dict)
+        
+        return TranscriptionPlugin(config, storage_plugin)
+        
+    except Exception as e:
+        logging.warning(f"Error loading transcription config: {e}, using defaults")
+        return TranscriptionPlugin(TranscriptionConfig(), storage_plugin)
+
+
+def test_phi_detection(text: str, sensitivity: str = "strict") -> Dict[str, Any]:
+    """Test PHI detection on sample text"""
+    detector = PHIDetector(sensitivity)
+    
+    # Detect PHI
+    phi_detections = detector.detect_phi(text)
+    
+    # Apply redaction
+    redacted_text = detector.redact_text(text, phi_detections, "#")
+    
+    # Get summary
+    summary = detector.get_redaction_summary(phi_detections)
+    
+    return {
+        'original_text': text,
+        'redacted_text': redacted_text,
+        'phi_detections': phi_detections,
+        'redaction_summary': summary,
+        'total_redactions': len(phi_detections)
+    }
+
+
+def test_whisper_transcription(audio_file_path: str, model_size: str = "small") -> Dict[str, Any]:
+    """Test Whisper transcription on audio file"""
+    try:
+        import librosa
+        
+        # Load audio file
+        audio_data, sample_rate = librosa.load(audio_file_path, sr=16000)
+        
+        # Initialize Whisper
+        engine = WhisperEngine(model_size, "cuda" if torch.cuda.is_available() else "cpu")
+        
+        # Transcribe
+        result = engine.transcribe_audio(audio_data)
+        
+        return {
+            'file_path': audio_file_path,
+            'audio_duration': len(audio_data) / sample_rate,
+            'transcription_result': result,
+            'success': True
+        }
+        
+    except Exception as e:
+        return {
+            'file_path': audio_file_path,
+            'error': str(e),
+            'success': False
+        }
+
+
+class TranscriptionTestSuite:
+    """Comprehensive testing suite for transcription plugin"""
+    
+    def __init__(self):
+        self.logger = logging.getLogger(__name__)
+    
+    def test_phi_patterns(self) -> Dict[str, Any]:
+        """Test PHI detection patterns"""
+        test_cases = [
+            # Medical conditions
+            "I have diabetes and high blood pressure",
+            "Patient shows symptoms of depression and anxiety",
+            "The cancer has spread to other organs",
+            
+            # Personal identifiers
+            "My SSN is 123-45-6789 and phone is 555-123-4567",
+            "Contact me at john.doe@email.com",
+            "I live at 123 Main Street, Anytown USA",
+            
+            # Names and titles
+            "My name is John Smith and I see Dr. Johnson",
+            "Call me Mary or contact Dr. Brown at the clinic",
+            
+            # Medications
+            "I take Lipitor 20mg twice daily",
+            "The doctor prescribed Adderall and Xanax",
+            "Take 2 pills of ibuprofen every 4 hours",
+            
+            # Mixed scenarios
+            "Hi Dr. Smith, this is Sarah Johnson. My SSN is 987-65-4321 and I've been having chest pain. I take Metformin for my diabetes.",
+            
+            # False positives (should NOT be redacted)
+            "I work in cancer research",
+            "The pain in my back from lifting weights",
+            "My friend John is visiting today"
+        ]
+        
+        detector = PHIDetector("strict")
+        results = []
+        
+        for test_text in test_cases:
+            result = test_phi_detection(test_text, "strict")
+            results.append(result)
+        
+        return {
+            'total_tests': len(test_cases),
+            'results': results,
+            'summary': {
+                'texts_with_phi': len([r for r in results if r['total_redactions'] > 0]),
+                'total_redactions': sum(r['total_redactions'] for r in results)
+            }
+        }
+    
+    def test_audio_buffer(self) -> Dict[str, Any]:
+        """Test audio buffering functionality"""
+        try:
+            buffer = AudioBuffer(buffer_seconds=1.0, overlap_seconds=0.2, sample_rate=16000)
+            
+            # Test adding audio chunks
+            chunk1 = np.random.random(8000).astype(np.float32)  # 0.5 seconds
+            chunk2 = np.random.random(8000).astype(np.float32)  # 0.5 seconds
+            chunk3 = np.random.random(4000).astype(np.float32)  # 0.25 seconds
+            
+            ready1 = buffer.add_audio(chunk1, time.time())
+            ready2 = buffer.add_audio(chunk2, time.time())
+            ready3 = buffer.add_audio(chunk3, time.time())
+            
+            # Should be ready after second chunk (1.0 seconds total)
+            if ready2:
+                audio_data, timestamp = buffer.get_audio_for_processing()
+                
+                return {
+                    'success': True,
+                    'buffer_tests': {
+                        'ready_after_chunk1': ready1,
+                        'ready_after_chunk2': ready2,
+                        'ready_after_chunk3': ready3,
+                        'extracted_audio_length': len(audio_data),
+                        'expected_length': 16000  # 1 second at 16kHz
+                    },
+                    'buffer_status': buffer.get_buffer_status()
+                }
+            else:
+                return {'success': False, 'error': 'Buffer not ready when expected'}
+                
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+    
+    def test_transcript_chunk_creation(self) -> Dict[str, Any]:
+        """Test transcript chunk creation and processing"""
+        try:
+            # Create test chunk
+            chunk = TranscriptChunk(
+                chunk_id=1,
+                session_id="test_session_123",
+                speaker_id="speaker_001",
+                text="Hello, my name is John and I have diabetes",
+                confidence=0.95,
+                start_time=time.time(),
+                end_time=time.time() + 1.0
+            )
+            
+            # Test PHI detection on chunk
+            detector = PHIDetector("strict")
+            phi_detections = detector.detect_phi(chunk.text)
+            
+            if phi_detections:
+                chunk.phi_detected = [phi['category'] for phi in phi_detections]
+                original_text = chunk.text
+                chunk.text = detector.redact_text(chunk.text, phi_detections, "#")
+                chunk.redaction_status = "redacted"
+            
+            return {
+                'success': True,
+                'chunk_data': chunk.to_dict(),
+                'phi_detected': len(phi_detections) > 0,
+                'redaction_applied': chunk.redaction_status == "redacted"
+            }
+            
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+    
+    def run_all_tests(self) -> Dict[str, Any]:
+        """Run all transcription tests"""
+        self.logger.info("Running transcription plugin test suite...")
+        
+        results = {
+            'phi_detection': self.test_phi_patterns(),
+            'audio_buffer': self.test_audio_buffer(),
+            'transcript_chunks': self.test_transcript_chunk_creation(),
+            'test_timestamp': time.time()
+        }
+        
+        # Calculate overall success
+        all_successful = all(
+            result.get('success', True) for result in results.values() 
+            if isinstance(result, dict)
+        )
+        
+        results['overall_success'] = all_successful
+        results['summary'] = {
+            'total_phi_tests': results['phi_detection']['total_tests'],
+            'phi_detections_found': results['phi_detection']['summary']['total_redactions'],
+            'audio_buffer_working': results['audio_buffer']['success'],
+            'chunk_processing_working': results['transcript_chunks']['success']
+        }
+        
+        self.logger.info(f"Test suite completed. Overall success: {all_successful}")
+        return results
+
+
+# Integration utilities for other plugins
+
+class TranscriptionManager:
+    """High-level manager for transcription operations"""
+    
+    def __init__(self, transcription_plugin: TranscriptionPlugin):
+        self.transcription_plugin = transcription_plugin
+        self.marquee_callbacks = []
+        self.logger = logging.getLogger(__name__)
+        
+        # Register for transcription events
+        self.transcription_plugin.add_callback('new_transcript', self._handle_new_transcript)
+        self.transcription_plugin.add_callback('redaction_update', self._handle_redaction)
+        self.transcription_plugin.add_callback('speaker_muted', self._handle_speaker_muted)
+    
+    def add_marquee_callback(self, callback: Callable):
+        """Add callback for marquee display updates"""
+        self.marquee_callbacks.append(callback)
+    
+    def _handle_new_transcript(self, transcript_data: Dict):
+        """Handle new transcript for marquee display"""
+        try:
+            # Format for marquee display
+            marquee_data = {
+                'type': 'new_text',
+                'speaker_id': transcript_data['speaker_id'],
+                'text': transcript_data['text'],
+                'confidence': transcript_data['confidence'],
+                'timestamp': transcript_data['start_time'],
+                'chunk_id': transcript_data['chunk_id']
+            }
+            
+            # Send to all marquee callbacks
+            for callback in self.marquee_callbacks:
+                callback(marquee_data)
+                
+        except Exception as e:
+            self.logger.error(f"Error handling new transcript: {e}")
+    
+    def _handle_redaction(self, redaction_data: Dict):
+        """Handle text redaction for marquee"""
+        try:
+            marquee_data = {
+                'type': 'redact_text',
+                'chunk_id': redaction_data['chunk_id'],
+                'redacted_text': redaction_data['redacted_text'],
+                'redaction_type': redaction_data['redaction_type']
+            }
+            
+            for callback in self.marquee_callbacks:
+                callback(marquee_data)
+                
+        except Exception as e:
+            self.logger.error(f"Error handling redaction: {e}")
+    
+    def _handle_speaker_muted(self, speaker_data: Dict):
+        """Handle speaker muting for marquee"""
+        try:
+            marquee_data = {
+                'type': 'mute_speaker',
+                'speaker_id': speaker_data['speaker_id'],
+                'redaction_type': speaker_data['redaction_type']
+            }
+            
+            for callback in self.marquee_callbacks:
+                callback(marquee_data)
+                
+        except Exception as e:
+            self.logger.error(f"Error handling speaker muting: {e}")
+    
+    def get_live_transcript(self, speaker_id: str = None, 
+                          last_n_chunks: int = 10) -> List[Dict]:
+        """Get recent transcript chunks for display"""
+        try:
+            chunks = self.transcription_plugin.transcript_chunks
+            
+            # Filter by speaker if specified
+            if speaker_id:
+                chunks = [c for c in chunks if c.speaker_id == speaker_id]
+            
+            # Get last N chunks
+            recent_chunks = chunks[-last_n_chunks:] if chunks else []
+            
+            return [chunk.to_dict() for chunk in recent_chunks]
+            
+        except Exception as e:
+            self.logger.error(f"Error getting live transcript: {e}")
+            return []
+
+
+if __name__ == "__main__":
+    # Test the transcription plugin
+    logging.basicConfig(level=logging.INFO)
+    
+    print("=== Eden Transcription Plugin Test Suite ===")
+    
+    # Run comprehensive tests
+    test_suite = TranscriptionTestSuite()
+    results = test_suite.run_all_tests()
+    
+    print(f"\n=== Test Results ===")
+    print(f"Overall Success: {results['overall_success']}")
+    print(f"PHI Detection Tests: {results['phi_detection']['total_tests']} cases")
+    print(f"PHI Detections Found: {results['phi_detection']['summary']['total_redactions']}")
+    print(f"Audio Buffer Working: {results['audio_buffer']['success']}")
+    print(f"Chunk Processing Working: {results['transcript_chunks']['success']}")
+    
+    # Test PHI detection with sample text
+    print(f"\n=== Sample PHI Detection ===")
+    sample_text = "Hi Dr. Smith, this is John Doe. My SSN is 123-45-6789 and I have diabetes. Please call me at 555-123-4567."
+    phi_result = test_phi_detection(sample_text, "strict")
+    
+    print(f"Original: {phi_result['original_text']}")
+    print(f"Redacted: {phi_result['redacted_text']}")
+    print(f"Detections: {phi_result['total_redactions']}")
+    print(f"Categories: {phi_result['redaction_summary']}")
+    
+    # Test plugin creation
+    print(f"\n=== Plugin Creation Test ===")
+    try:
+        plugin = create_transcription_plugin()
+        print(f"Plugin created: {plugin.name}")
+        print(f"Enabled: {plugin.enabled}")
+        
+        # Test session lifecycle
+        session_id = "test_session_transcription_123"
+        plugin.on_recording_started(session_id)
+        plugin.on_speaker_detected("speaker_001", session_id)
+        
+        # Simulate transcript callback
+        def test_marquee_callback(data):
+            print(f"Marquee update: {data['type']} - {data.get('text', '')[:50]}...")
+        
+        plugin.add_callback('new_transcript', test_marquee_callback)
+        plugin.add_callback('redaction_update', test_marquee_callback)
+        
+        # Get statistics
+        stats = plugin.get_transcription_statistics()
+        print(f"Plugin stats: {stats}")
+        
+        # Simulate consent revocation
+        plugin.on_consent_revoked("speaker_001", "CT-test123")
+        
+        # Stop session
+        plugin.on_recording_stopped(session_id)
+        
+        # Cleanup
+        plugin.cleanup()
+        
+        print("Plugin test completed successfully")
+        
+    except Exception as e:
+        print(f"Plugin test failed: {e}")
+    
+    print(f"\n=== Test Suite Complete ===")
