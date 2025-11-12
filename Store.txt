@@ -1,0 +1,1232 @@
+﻿"""
+Eden Storage Plugin - Part 1
+Central database coordinator and file management system for all plugins.
+Database setup and core classes.
+
+
+File: src/plugins/storage/plugin.py
+"""
+
+
+import os
+import time
+import json
+import logging
+import threading
+import sqlite3
+import shutil
+from typing import Dict, List, Optional, Any, Union
+from dataclasses import dataclass, field
+from pathlib import Path
+from contextlib import contextmanager
+import hashlib
+from datetime import datetime, timedelta
+
+
+from src.core.audio_recorder import AudioChunk, PluginInterface
+
+
+
+
+@dataclass
+class StorageConfig:
+    """Configuration for storage plugin"""
+    enabled: bool = True
+    database_path: str = "data/eden_pipeline.db"
+    backup_enabled: bool = True
+    backup_directory: str = "data/backups"
+    backup_interval_hours: int = 24
+    
+    # File management
+    archive_enabled: bool = True
+    archive_directory: str = "data/archive"
+    archive_age_days: int = 90
+    
+    # Storage limits
+    max_storage_gb: float = 50.0
+    cleanup_threshold_percent: float = 85.0
+    
+    # Performance
+    connection_pool_size: int = 5
+    transaction_timeout: float = 30.0
+    vacuum_interval_days: int = 7
+
+
+
+
+@dataclass
+class SessionInfo:
+    """Session information for database storage"""
+    session_id: str
+    start_time: float
+    end_time: Optional[float] = None
+    status: str = "active"  # active, completed, error
+    total_speakers: int = 0
+    total_duration: float = 0.0
+    file_count: int = 0
+    storage_size: int = 0
+    
+    def to_dict(self) -> dict:
+        return {
+            'session_id': self.session_id,
+            'start_time': self.start_time,
+            'end_time': self.end_time,
+            'status': self.status,
+            'total_speakers': self.total_speakers,
+            'total_duration': self.total_duration,
+            'file_count': self.file_count,
+            'storage_size': self.storage_size
+        }
+
+
+
+
+class DatabaseManager:
+    """Centralized database management for all plugins"""
+    
+    def __init__(self, database_path: str, connection_pool_size: int = 5):
+        self.database_path = database_path
+        self.connection_pool_size = connection_pool_size
+        self.lock = threading.Lock()
+        self.logger = logging.getLogger(__name__)
+        
+        # Initialize database
+        self._init_database()
+        
+        self.logger.info(f"Database manager initialized: {database_path}")
+    
+    def _init_database(self):
+        """Initialize all database tables for all plugins"""
+        
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(self.database_path), exist_ok=True)
+        
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Core sessions table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS sessions (
+                    session_id TEXT PRIMARY KEY,
+                    start_time REAL NOT NULL,
+                    end_time REAL,
+                    status TEXT DEFAULT 'active',
+                    total_speakers INTEGER DEFAULT 0,
+                    total_duration REAL DEFAULT 0.0,
+                    file_count INTEGER DEFAULT 0,
+                    storage_size INTEGER DEFAULT 0,
+                    metadata TEXT,
+                    created_at REAL DEFAULT (strftime('%s', 'now')),
+                    updated_at REAL DEFAULT (strftime('%s', 'now'))
+                )
+            ''')
+            
+            # Speakers table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS speakers (
+                    speaker_id TEXT PRIMARY KEY,
+                    voiceprint_hash TEXT UNIQUE,
+                    first_seen REAL NOT NULL,
+                    last_seen REAL,
+                    total_sessions INTEGER DEFAULT 0,
+                    total_speech_time REAL DEFAULT 0.0,
+                    confidence_avg REAL DEFAULT 0.0,
+                    metadata TEXT,
+                    created_at REAL DEFAULT (strftime('%s', 'now')),
+                    updated_at REAL DEFAULT (strftime('%s', 'now'))
+                )
+            ''')
+            
+            # Audio chunks tracking
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS audio_chunks (
+                    chunk_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    speaker_id TEXT,
+                    timestamp REAL NOT NULL,
+                    duration REAL,
+                    sample_rate INTEGER,
+                    is_speech BOOLEAN,
+                    confidence REAL,
+                    file_offset INTEGER,
+                    consent_token TEXT,
+                    created_at REAL DEFAULT (strftime('%s', 'now')),
+                    FOREIGN KEY (session_id) REFERENCES sessions (session_id),
+                    FOREIGN KEY (speaker_id) REFERENCES speakers (speaker_id)
+                )
+            ''')
+            
+            # Consent tokens (centralized from consent plugin)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS consent_tokens (
+                    token_id TEXT PRIMARY KEY,
+                    speaker_id TEXT NOT NULL,
+                    voiceprint_hash TEXT,
+                    granted_timestamp REAL NOT NULL,
+                    revoked_timestamp REAL,
+                    reinstatement_timestamp REAL,
+                    current_status TEXT DEFAULT 'active',
+                    grace_expires REAL,
+                    consent_data TEXT,
+                    created_at REAL DEFAULT (strftime('%s', 'now')),
+                    updated_at REAL DEFAULT (strftime('%s', 'now')),
+                    FOREIGN KEY (speaker_id) REFERENCES speakers (speaker_id)
+                )
+            ''')
+            
+            # Consent events log
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS consent_events (
+                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    token_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    phrase_detected TEXT,
+                    confidence REAL,
+                    timestamp REAL NOT NULL,
+                    action_taken TEXT,
+                    metadata TEXT,
+                    created_at REAL DEFAULT (strftime('%s', 'now')),
+                    FOREIGN KEY (token_id) REFERENCES consent_tokens (token_id)
+                )
+            ''')
+            
+            # File manifest
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS files (
+                    file_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    speaker_id TEXT,
+                    file_path TEXT NOT NULL,
+                    file_type TEXT NOT NULL,
+                    file_size INTEGER,
+                    consent_token TEXT,
+                    encryption_key_id TEXT,
+                    checksum TEXT,
+                    created_at REAL DEFAULT (strftime('%s', 'now')),
+                    archived_at REAL,
+                    deleted_at REAL,
+                    FOREIGN KEY (session_id) REFERENCES sessions (session_id),
+                    FOREIGN KEY (speaker_id) REFERENCES speakers (speaker_id)
+                )
+            ''')
+            
+            # Encryption keys
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS encryption_keys (
+                    key_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    wrapped_key BLOB NOT NULL,
+                    algorithm TEXT DEFAULT 'AES-256-GCM',
+                    key_purpose TEXT,
+                    created_at REAL DEFAULT (strftime('%s', 'now')),
+                    disposed_at REAL,
+                    FOREIGN KEY (session_id) REFERENCES sessions (session_id)
+                )
+            ''')
+            
+            # Transcription data
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS transcripts (
+                    transcript_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chunk_id INTEGER,
+                    session_id TEXT NOT NULL,
+                    speaker_id TEXT,
+                    text TEXT NOT NULL,
+                    confidence REAL,
+                    timestamp REAL NOT NULL,
+                    language TEXT DEFAULT 'en-US',
+                    processing_time REAL,
+                    metadata TEXT,
+                    created_at REAL DEFAULT (strftime('%s', 'now')),
+                    FOREIGN KEY (chunk_id) REFERENCES audio_chunks (chunk_id),
+                    FOREIGN KEY (session_id) REFERENCES sessions (session_id),
+                    FOREIGN KEY (speaker_id) REFERENCES speakers (speaker_id)
+                )
+            ''')
+            
+            # Voiceprint embeddings
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS voiceprints (
+                    voiceprint_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    speaker_id TEXT NOT NULL,
+                    embedding_data BLOB NOT NULL,
+                    model_version TEXT,
+                    extraction_timestamp REAL NOT NULL,
+                    confidence REAL,
+                    wallet_address TEXT,
+                    verification_hash TEXT,
+                    metadata TEXT,
+                    created_at REAL DEFAULT (strftime('%s', 'now')),
+                    FOREIGN KEY (speaker_id) REFERENCES speakers (speaker_id)
+                )
+            ''')
+            
+            # Data lineage (tracks data flow between plugins)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS data_lineage (
+                    lineage_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_id TEXT NOT NULL,
+                    target_id TEXT NOT NULL,
+                    source_type TEXT NOT NULL,
+                    target_type TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    timestamp REAL NOT NULL,
+                    metadata TEXT,
+                    created_at REAL DEFAULT (strftime('%s', 'now'))
+                )
+            ''')
+            
+            # Plugin performance metrics
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS plugin_metrics (
+                    metric_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    plugin_name TEXT NOT NULL,
+                    session_id TEXT,
+                    metric_type TEXT NOT NULL,
+                    metric_value REAL NOT NULL,
+                    timestamp REAL NOT NULL,
+                    metadata TEXT,
+                    created_at REAL DEFAULT (strftime('%s', 'now'))
+                )
+            ''')
+            
+            # Create indexes for performance
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_sessions_time ON sessions (start_time)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_chunks_session ON audio_chunks (session_id)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_consent_tokens_speaker ON consent_tokens (speaker_id)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_files_session ON files (session_id)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_transcripts_session ON transcripts (session_id)')
+            
+            conn.commit()
+        
+        self.logger.info("Database tables initialized successfully")
+    
+    @contextmanager
+    def get_connection(self):
+        """Get database connection with automatic cleanup"""
+        conn = None
+        try:
+            conn = sqlite3.connect(
+                self.database_path,
+                timeout=30.0,
+                check_same_thread=False
+            )
+            conn.row_factory = sqlite3.Row  # Enable column access by name
+            yield conn
+        except Exception as e:
+            if conn:
+                conn.rollback()
+            self.logger.error(f"Database error: {e}")
+            raise
+        finally:
+            if conn:
+                conn.close()
+    
+    def execute_query(self, query: str, params: tuple = ()) -> List[sqlite3.Row]:
+        """Execute SELECT query and return results"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            return cursor.fetchall()
+    
+    def execute_update(self, query: str, params: tuple = ()) -> int:
+        """Execute INSERT/UPDATE/DELETE query and return affected rows"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            conn.commit()
+            return cursor.rowcount
+    
+    def execute_batch(self, query: str, param_list: List[tuple]) -> int:
+        """Execute batch operations for better performance"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.executemany(query, param_list)
+            conn.commit()
+            return cursor.rowcount
+
+
+
+
+class FileManager:
+    """Manages file operations and storage policies"""
+    
+    def __init__(self, config: StorageConfig):
+        self.config = config
+        self.logger = logging.getLogger(__name__)
+        
+        # Ensure directories exist
+        for directory in [config.backup_directory, config.archive_directory]:
+            os.makedirs(directory, exist_ok=True)
+    
+    def get_storage_usage(self) -> Dict[str, Any]:
+        """Get current storage usage statistics"""
+        try:
+            # Get data directory size
+            data_dir = Path("data")
+            total_size = sum(f.stat().st_size for f in data_dir.rglob('*') if f.is_file())
+            
+            # Get available space
+            total, used, free = shutil.disk_usage(data_dir)
+            
+            return {
+                'data_size_bytes': total_size,
+                'data_size_gb': total_size / (1024**3),
+                'total_disk_gb': total / (1024**3),
+                'used_disk_gb': used / (1024**3),
+                'free_disk_gb': free / (1024**3),
+                'usage_percent': (used / total) * 100
+            }
+        except Exception as e:
+            self.logger.error(f"Error getting storage usage: {e}")
+            return {}
+    
+    def check_storage_limits(self) -> bool:
+        """Check if storage limits are exceeded"""
+        usage = self.get_storage_usage()
+        
+        # Check configured data limit
+        data_gb = usage.get('data_size_gb', 0)
+        if data_gb > self.config.max_storage_gb:
+            self.logger.warning(f"Data size ({data_gb:.1f}GB) exceeds limit ({self.config.max_storage_gb}GB)")
+            return False
+        
+        # Check disk usage threshold
+        usage_percent = usage.get('usage_percent', 0)
+        if usage_percent > self.config.cleanup_threshold_percent:
+            self.logger.warning(f"Disk usage ({usage_percent:.1f}%) exceeds threshold ({self.config.cleanup_threshold_percent}%)")
+            return False
+        
+        return True
+    def archive_old_sessions(self, db_manager, age_days: int = None):
+        """Archive sessions older than specified days"""
+        if not self.config.archive_enabled:
+            return
+        
+        age_days = age_days or self.config.archive_age_days
+        cutoff_time = time.time() - (age_days * 24 * 3600)
+        
+        try:
+            # Get old sessions
+            old_sessions = db_manager.execute_query(
+                'SELECT session_id, start_time FROM sessions WHERE start_time < ? AND status != "archived"',
+                (cutoff_time,)
+            )
+            
+            archive_dir = Path(self.config.archive_directory)
+            
+            for session in old_sessions:
+                session_id = session['session_id']
+                
+                # Move session files to archive
+                session_files = db_manager.execute_query(
+                    'SELECT file_path FROM files WHERE session_id = ? AND deleted_at IS NULL',
+                    (session_id,)
+                )
+                
+                for file_row in session_files:
+                    file_path = Path(file_row['file_path'])
+                    if file_path.exists():
+                        # Create archive path
+                        archive_path = archive_dir / file_path.name
+                        shutil.move(str(file_path), str(archive_path))
+                        
+                        # Update database
+                        db_manager.execute_update(
+                            'UPDATE files SET file_path = ?, archived_at = ? WHERE file_path = ?',
+                            (str(archive_path), time.time(), str(file_path))
+                        )
+                
+                # Update session status
+                db_manager.execute_update(
+                    'UPDATE sessions SET status = "archived", updated_at = ? WHERE session_id = ?',
+                    (time.time(), session_id)
+                )
+                
+                self.logger.info(f"Archived session: {session_id}")
+        
+        except Exception as e:
+            self.logger.error(f"Error archiving sessions: {e}")
+    
+    def cleanup_expired_consent(self, db_manager):
+        """Delete files for expired consent tokens"""
+        try:
+            # Get expired consent tokens in grace period that have expired
+            expired_tokens = db_manager.execute_query('''
+                SELECT token_id, speaker_id FROM consent_tokens 
+                WHERE current_status = 'revoked' 
+                AND grace_expires IS NOT NULL 
+                AND grace_expires < ?
+            ''', (time.time(),))
+            
+            for token in expired_tokens:
+                token_id = token['token_id']
+                
+                # Get files associated with this consent token
+                files_to_delete = db_manager.execute_query(
+                    'SELECT file_id, file_path FROM files WHERE consent_token = ? AND deleted_at IS NULL',
+                    (token_id,)
+                )
+                
+                # Delete files
+                for file_row in files_to_delete:
+                    file_path = Path(file_row['file_path'])
+                    if file_path.exists():
+                        file_path.unlink()
+                    
+                    # Mark as deleted in database
+                    db_manager.execute_update(
+                        'UPDATE files SET deleted_at = ? WHERE file_id = ?',
+                        (time.time(), file_row['file_id'])
+                    )
+                
+                # Update consent token status
+                db_manager.execute_update(
+                    'UPDATE consent_tokens SET current_status = "deleted", updated_at = ? WHERE token_id = ?',
+                    (time.time(), token_id)
+                )
+                
+                self.logger.info(f"Deleted files for expired consent token: {token_id}")
+        
+        except Exception as e:
+            self.logger.error(f"Error cleaning up expired consent: {e}")
+    
+    def backup_database(self, db_manager):
+        """Create database backup"""
+        if not self.config.backup_enabled:
+            return
+        
+        try:
+            backup_dir = Path(self.config.backup_directory)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_file = backup_dir / f"eden_pipeline_backup_{timestamp}.db"
+            
+            # Copy database file
+            shutil.copy2(db_manager.database_path, backup_file)
+            
+            # Compress backup (optional)
+            import gzip
+            with open(backup_file, 'rb') as f_in:
+                with gzip.open(f"{backup_file}.gz", 'wb') as f_out:
+                    shutil.copyfileobj(f_in, f_out)
+            
+            # Remove uncompressed backup
+            backup_file.unlink()
+            
+            self.logger.info(f"Database backup created: {backup_file}.gz")
+            
+            # Clean up old backups (keep last 10)
+            backups = sorted(backup_dir.glob("eden_pipeline_backup_*.db.gz"))
+            for old_backup in backups[:-10]:
+                old_backup.unlink()
+                
+        except Exception as e:
+            self.logger.error(f"Error creating database backup: {e}")
+
+
+
+
+class StoragePlugin:
+    """Main storage plugin implementing PluginInterface"""
+    
+    def __init__(self, config: StorageConfig):
+        self.config = config
+        self._enabled = config.enabled
+        
+        # Core components
+        self.db_manager = DatabaseManager(config.database_path, config.connection_pool_size)
+        self.file_manager = FileManager(config)
+        
+        # Current session tracking
+        self.current_session: Optional[SessionInfo] = None
+        self.chunk_counter = 0
+        
+        # Background maintenance
+        self.maintenance_thread = None
+        self.running = threading.Event()
+        
+        self.logger = logging.getLogger(__name__)
+        
+        # Start background maintenance
+        self._start_maintenance()
+    
+    @property
+    def name(self) -> str:
+        return "StoragePlugin"
+    
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+    
+    def process_audio(self, chunk: AudioChunk) -> Optional[AudioChunk]:
+        """Log audio chunk metadata to database (transparent to other plugins)"""
+        if not self.enabled or not self.current_session:
+            return chunk
+        
+        try:
+            # Log audio chunk
+            self.log_audio_chunk(chunk)
+            
+            # Update session statistics
+            self._update_session_stats(chunk)
+            
+        except Exception as e:
+            self.logger.error(f"Error processing audio chunk: {e}")
+        
+        # Return chunk unchanged (transparent operation)
+        return chunk
+    
+    def on_recording_started(self, session_id: str) -> None:
+        """Initialize storage for new session"""
+        try:
+            self.logger.info(f"Starting storage for session: {session_id}")
+            
+            # Create session info
+            self.current_session = SessionInfo(
+                session_id=session_id,
+                start_time=time.time(),
+                status="active"
+            )
+            
+            # Insert session into database
+            self.create_session(self.current_session)
+            
+            # Reset counters
+            self.chunk_counter = 0
+            
+        except Exception as e:
+            self.logger.error(f"Failed to start storage session: {e}")
+    
+    def on_recording_stopped(self, session_id: str) -> None:
+        """Finalize storage for completed session"""
+        try:
+            self.logger.info(f"Stopping storage for session: {session_id}")
+            
+            if self.current_session:
+                # Update session end time and status
+                self.current_session.end_time = time.time()
+                self.current_session.status = "completed"
+                self.current_session.total_duration = (
+                    self.current_session.end_time - self.current_session.start_time
+                )
+                
+                # Update database
+                self.update_session(self.current_session)
+                
+                # Reset current session
+                self.current_session = None
+            
+        except Exception as e:
+            self.logger.error(f"Failed to stop storage session: {e}")
+    
+    def on_speaker_detected(self, speaker_id: str, session_id: str) -> None:
+        """Handle new speaker detection"""
+        if not self.enabled:
+            return
+        
+        try:
+            # Create or update speaker record
+            self.create_or_update_speaker(speaker_id)
+            
+            # Update session speaker count
+            if self.current_session:
+                self.current_session.total_speakers += 1
+                self.update_session(self.current_session)
+            
+        except Exception as e:
+            self.logger.error(f"Error handling speaker detection: {e}")
+    
+    # Database interface methods for other plugins
+    
+    def create_session(self, session_info: SessionInfo):
+        """Create new session record"""
+        self.db_manager.execute_update('''
+            INSERT INTO sessions 
+            (session_id, start_time, end_time, status, total_speakers, 
+             total_duration, file_count, storage_size, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            session_info.session_id,
+            session_info.start_time,
+            session_info.end_time,
+            session_info.status,
+            session_info.total_speakers,
+            session_info.total_duration,
+            session_info.file_count,
+            session_info.storage_size,
+            json.dumps(session_info.to_dict())
+        ))
+    
+    def update_session(self, session_info: SessionInfo):
+        """Update existing session record"""
+        self.db_manager.execute_update('''
+            UPDATE sessions SET 
+            end_time = ?, status = ?, total_speakers = ?, 
+            total_duration = ?, file_count = ?, storage_size = ?,
+            metadata = ?, updated_at = ?
+            WHERE session_id = ?
+        ''', (
+            session_info.end_time,
+            session_info.status,
+            session_info.total_speakers,
+            session_info.total_duration,
+            session_info.file_count,
+            session_info.storage_size,
+            json.dumps(session_info.to_dict()),
+            time.time(),
+            session_info.session_id
+        ))
+    
+    def log_audio_chunk(self, chunk: AudioChunk) -> int:
+        """Log audio chunk to database and return chunk_id"""
+        cursor_id = self.db_manager.execute_update('''
+            INSERT INTO audio_chunks 
+            (session_id, speaker_id, timestamp, duration, sample_rate, 
+             is_speech, confidence, consent_token)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            chunk.session_id,
+            chunk.speaker_id,
+            chunk.timestamp,
+            len(chunk.data) / chunk.sample_rate if chunk.sample_rate > 0 else 0,
+            chunk.sample_rate,
+            chunk.is_speech,
+            chunk.confidence,
+            chunk.consent_token
+        ))
+        
+        self.chunk_counter += 1
+        return cursor_id
+    
+    def create_or_update_speaker(self, speaker_id: str, voiceprint_hash: str = None):
+        """Create or update speaker record"""
+        # Check if speaker exists
+        existing = self.db_manager.execute_query(
+            'SELECT speaker_id FROM speakers WHERE speaker_id = ?',
+            (speaker_id,)
+        )
+        
+        if existing:
+            # Update existing speaker
+            self.db_manager.execute_update('''
+                UPDATE speakers SET 
+                last_seen = ?, total_sessions = total_sessions + 1, updated_at = ?
+                WHERE speaker_id = ?
+            ''', (time.time(), time.time(), speaker_id))
+        else:
+            # Create new speaker
+            self.db_manager.execute_update('''
+                INSERT INTO speakers 
+                (speaker_id, voiceprint_hash, first_seen, last_seen, total_sessions)
+                VALUES (?, ?, ?, ?, 1)
+            ''', (speaker_id, voiceprint_hash, time.time(), time.time()))
+    
+    def log_file(self, session_id: str, file_path: str, file_type: str, 
+                speaker_id: str = None, consent_token: str = None) -> int:
+        """Log file creation to database"""
+        file_size = 0
+        checksum = ""
+        
+        if os.path.exists(file_path):
+            file_size = os.path.getsize(file_path)
+            # Calculate checksum for integrity
+            with open(file_path, 'rb') as f:
+                checksum = hashlib.sha256(f.read()).hexdigest()
+        
+        file_id = self.db_manager.execute_update('''
+            INSERT INTO files 
+            (session_id, speaker_id, file_path, file_type, file_size, 
+             consent_token, checksum)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (session_id, speaker_id, file_path, file_type, file_size, consent_token, checksum))
+        
+        # Update session file count
+        if self.current_session:
+            self.current_session.file_count += 1
+            self.current_session.storage_size += file_size
+        
+        return file_id
+    
+    def log_consent_event(self, token_id: str, event_type: str, 
+                         phrase_detected: str = None, confidence: float = None,
+                         action_taken: str = None, metadata: dict = None):
+        """Log consent event"""
+        self.db_manager.execute_update('''
+            INSERT INTO consent_events 
+            (token_id, event_type, phrase_detected, confidence, 
+             timestamp, action_taken, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            token_id, event_type, phrase_detected, confidence,
+            time.time(), action_taken, json.dumps(metadata) if metadata else None
+        ))
+    
+    def save_transcript(self, chunk_id: int, session_id: str, speaker_id: str,
+                       text: str, confidence: float, timestamp: float = None) -> int:
+        """Save transcript data"""
+        if timestamp is None:
+            timestamp = time.time()
+        
+        return self.db_manager.execute_update('''
+            INSERT INTO transcripts 
+            (chunk_id, session_id, speaker_id, text, confidence, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (chunk_id, session_id, speaker_id, text, confidence, timestamp))
+    
+    def save_voiceprint(self, speaker_id: str, embedding_data: bytes,
+                       model_version: str, confidence: float = None,
+                       wallet_address: str = None) -> int:
+        """Save voiceprint embedding"""
+        return self.db_manager.execute_update('''
+            INSERT INTO voiceprints 
+            (speaker_id, embedding_data, model_version, extraction_timestamp,
+             confidence, wallet_address)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (speaker_id, embedding_data, model_version, time.time(), confidence, wallet_address))
+    
+    def log_plugin_metric(self, plugin_name: str, metric_type: str, 
+                         metric_value: float, session_id: str = None,
+                         metadata: dict = None):
+        """Log plugin performance metric"""
+        self.db_manager.execute_update('''
+            INSERT INTO plugin_metrics 
+            (plugin_name, session_id, metric_type, metric_value, timestamp, metadata)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (
+            plugin_name, session_id, metric_type, metric_value,
+            time.time(), json.dumps(metadata) if metadata else None
+        ))
+def get_storage_statistics(self) -> Dict[str, Any]:
+        """Get comprehensive storage statistics"""
+        try:
+            stats = {}
+            
+            # Session statistics
+            session_stats = self.db_manager.execute_query('''
+                SELECT 
+                    COUNT(*) as total_sessions,
+                    COUNT(CASE WHEN status = 'active' THEN 1 END) as active_sessions,
+                    COUNT(CASE WHEN status = 'completed' THEN 1 END) as completed_sessions,
+                    AVG(total_duration) as avg_duration,
+                    SUM(storage_size) as total_storage
+                FROM sessions
+            ''')[0]
+            
+            stats['sessions'] = dict(session_stats)
+            
+            # Speaker statistics
+            speaker_stats = self.db_manager.execute_query('''
+                SELECT COUNT(*) as total_speakers,
+                       AVG(total_sessions) as avg_sessions_per_speaker,
+                       AVG(total_speech_time) as avg_speech_time
+                FROM speakers
+            ''')[0]
+            
+            stats['speakers'] = dict(speaker_stats)
+            
+            # File statistics
+            file_stats = self.db_manager.execute_query('''
+                SELECT 
+                    COUNT(*) as total_files,
+                    COUNT(CASE WHEN deleted_at IS NULL THEN 1 END) as active_files,
+                    COUNT(CASE WHEN archived_at IS NOT NULL THEN 1 END) as archived_files,
+                    SUM(file_size) as total_file_size,
+                    file_type,
+                    COUNT(*) as count_by_type
+                FROM files 
+                GROUP BY file_type
+            ''')
+            
+            stats['files'] = {
+                'total': 0,
+                'active': 0,
+                'archived': 0,
+                'total_size': 0,
+                'by_type': {}
+            }
+            
+            for row in file_stats:
+                if row['file_type']:
+                    stats['files']['by_type'][row['file_type']] = row['count_by_type']
+                stats['files']['total'] += row['count_by_type'] or 0
+                
+            # Get overall file stats
+            overall_files = self.db_manager.execute_query('''
+                SELECT 
+                    COUNT(CASE WHEN deleted_at IS NULL THEN 1 END) as active_files,
+                    COUNT(CASE WHEN archived_at IS NOT NULL THEN 1 END) as archived_files,
+                    SUM(CASE WHEN deleted_at IS NULL THEN file_size ELSE 0 END) as total_size
+                FROM files
+            ''')[0]
+            
+            stats['files'].update(dict(overall_files))
+            
+            # Storage usage
+            stats['storage'] = self.file_manager.get_storage_usage()
+            
+            # Recent activity
+            recent_activity = self.db_manager.execute_query('''
+                SELECT COUNT(*) as chunks_last_hour
+                FROM audio_chunks 
+                WHERE created_at > ?
+            ''', (time.time() - 3600,))[0]
+            
+            stats['activity'] = dict(recent_activity)
+            
+            return stats
+            
+        except Exception as e:
+            self.logger.error(f"Error getting storage statistics: {e}")
+            return {}
+    
+        def _update_session_stats(self, chunk: AudioChunk):
+            """Update session statistics with new chunk"""
+        if not self.current_session:
+            return
+        
+        # Update duration (approximate)
+        chunk_duration = len(chunk.data) / chunk.sample_rate if chunk.sample_rate > 0 else 0
+        self.current_session.total_duration += chunk_duration
+        
+        # Periodically update database (every 100 chunks)
+        if self.chunk_counter % 100 == 0:
+            self.update_session(self.current_session)
+        def _start_maintenance(self):
+            """Start background maintenance thread"""
+        if not self.enabled:
+            return
+        
+        self.running.set()
+        self.maintenance_thread = threading.Thread(
+            target=self._maintenance_worker,
+            daemon=True,
+            name="StorageMaintenance"
+        )
+        self.maintenance_thread.start()
+        
+        self.logger.info("Storage maintenance thread started")
+    
+        def _maintenance_worker(self):
+            """Background maintenance worker"""
+        last_backup = 0
+        last_cleanup = 0
+        last_archive = 0
+        last_vacuum = 0
+        
+        while self.running.is_set():
+            try:
+                current_time = time.time()
+                
+                # Database backup
+                if (current_time - last_backup) > (self.config.backup_interval_hours * 3600):
+                    self.file_manager.backup_database(self.db_manager)
+                    last_backup = current_time
+                
+                # Consent cleanup
+                if (current_time - last_cleanup) > 3600:  # Every hour
+                    self.file_manager.cleanup_expired_consent(self.db_manager)
+                    last_cleanup = current_time
+                
+                # Archive old sessions
+                if (current_time - last_archive) > (24 * 3600):  # Daily
+                    self.file_manager.archive_old_sessions(self.db_manager)
+                    last_archive = current_time
+                
+                # Database vacuum
+                if (current_time - last_vacuum) > (self.config.vacuum_interval_days * 24 * 3600):
+                    self._vacuum_database()
+                    last_vacuum = current_time
+                
+                # Check storage limits
+                if not self.file_manager.check_storage_limits():
+                    self._handle_storage_limit_exceeded()
+                
+                # Sleep for 5 minutes between checks
+                time.sleep(300)
+                
+            except Exception as e:
+                self.logger.error(f"Maintenance worker error: {e}")
+                time.sleep(60)  # Wait longer on error
+    
+        def _vacuum_database(self):
+            """Vacuum database to reclaim space"""
+        try:
+            with self.db_manager.get_connection() as conn:
+                conn.execute('VACUUM')
+                conn.commit()
+            self.logger.info("Database vacuum completed")
+        except Exception as e:
+            self.logger.error(f"Database vacuum failed: {e}")
+    
+        def _handle_storage_limit_exceeded(self):
+            """Handle storage limit exceeded"""
+        self.logger.warning("Storage limit exceeded, initiating cleanup")
+        
+        try:
+            # Force archive of older sessions
+            self.file_manager.archive_old_sessions(self.db_manager, age_days=30)
+            
+            # Cleanup expired consent more aggressively
+            self.file_manager.cleanup_expired_consent(self.db_manager)
+            
+            # Log storage event
+            self.log_plugin_metric(
+                "StoragePlugin", 
+                "storage_limit_exceeded", 
+                1.0,
+                metadata=self.file_manager.get_storage_usage()
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Storage cleanup failed: {e}")
+    
+        def export_session_data(self, session_id: str, export_path: str) -> bool:
+            """Export complete session data for analysis"""
+        try:
+            export_dir = Path(export_path)
+            export_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Export session metadata
+            session_data = self.db_manager.execute_query(
+                'SELECT * FROM sessions WHERE session_id = ?',
+                (session_id,)
+            )
+            
+            if not session_data:
+                self.logger.error(f"Session {session_id} not found")
+                return False
+            
+            # Create export package
+            export_package = {
+                'session': dict(session_data[0]),
+                'speakers': [],
+                'audio_chunks': [],
+                'files': [],
+                'transcripts': [],
+                'consent_events': []
+            }
+            
+            # Get speakers
+            speakers = self.db_manager.execute_query('''
+                SELECT DISTINCT s.* FROM speakers s
+                JOIN audio_chunks ac ON s.speaker_id = ac.speaker_id
+                WHERE ac.session_id = ?
+            ''', (session_id,))
+            
+            export_package['speakers'] = [dict(s) for s in speakers]
+            
+            # Get audio chunks
+            chunks = self.db_manager.execute_query(
+                'SELECT * FROM audio_chunks WHERE session_id = ? ORDER BY timestamp',
+                (session_id,)
+            )
+            export_package['audio_chunks'] = [dict(c) for c in chunks]
+            
+            # Get files
+            files = self.db_manager.execute_query(
+                'SELECT * FROM files WHERE session_id = ?',
+                (session_id,)
+            )
+            export_package['files'] = [dict(f) for f in files]
+            
+            # Get transcripts
+            transcripts = self.db_manager.execute_query(
+                'SELECT * FROM transcripts WHERE session_id = ? ORDER BY timestamp',
+                (session_id,)
+            )
+            export_package['transcripts'] = [dict(t) for t in transcripts]
+            
+            # Get consent events
+            consent_events = self.db_manager.execute_query('''
+                SELECT ce.* FROM consent_events ce
+                JOIN audio_chunks ac ON ce.token_id = ac.consent_token
+                WHERE ac.session_id = ?
+            ''', (session_id,))
+            export_package['consent_events'] = [dict(ce) for ce in consent_events]
+            
+            # Save export package
+            export_file = export_dir / f"session_{session_id}_export.json"
+            with open(export_file, 'w') as f:
+                json.dump(export_package, f, indent=2, default=str)
+            
+            self.logger.info(f"Session data exported to: {export_file}")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Export failed for session {session_id}: {e}")
+            return False
+    
+        def get_consent_status_report(self) -> Dict[str, Any]:
+            """Generate consent status report for compliance"""
+        try:
+            report = {}
+            
+            # Active consent tokens
+            active_tokens = self.db_manager.execute_query('''
+                SELECT COUNT(*) as count FROM consent_tokens 
+                WHERE current_status = 'active'
+            ''')[0]['count']
+            
+            # Revoked tokens in grace period
+            grace_period_tokens = self.db_manager.execute_query('''
+                SELECT COUNT(*) as count FROM consent_tokens 
+                WHERE current_status = 'revoked' AND grace_expires > ?
+            ''', (time.time(),))[0]['count']
+            
+            # Expired tokens (should be deleted)
+            expired_tokens = self.db_manager.execute_query('''
+                SELECT COUNT(*) as count FROM consent_tokens 
+                WHERE current_status = 'revoked' AND grace_expires <= ?
+            ''', (time.time(),))[0]['count']
+            
+            # Files pending deletion
+            pending_deletion = self.db_manager.execute_query('''
+                SELECT COUNT(*) as count FROM files f
+                JOIN consent_tokens ct ON f.consent_token = ct.token_id
+                WHERE ct.current_status = 'revoked' AND ct.grace_expires > ?
+                AND f.deleted_at IS NULL
+            ''', (time.time(),))[0]['count']
+            
+            # Recent consent events
+            recent_events = self.db_manager.execute_query('''
+                SELECT event_type, COUNT(*) as count FROM consent_events 
+                WHERE timestamp > ? GROUP BY event_type
+            ''', (time.time() - 86400,))  # Last 24 hours
+            
+            report = {
+                'active_consent_tokens': active_tokens,
+                'grace_period_tokens': grace_period_tokens,
+                'expired_tokens': expired_tokens,
+                'files_pending_deletion': pending_deletion,
+                'recent_events': {row['event_type']: row['count'] for row in recent_events},
+                'report_timestamp': time.time()
+            }
+            
+            return report
+            
+        except Exception as e:
+            self.logger.error(f"Error generating consent report: {e}")
+            return {}
+    
+        def cleanup(self) -> None:
+            """Clean up storage plugin resources"""
+        self.running.clear()
+        
+        if self.maintenance_thread and self.maintenance_thread.is_alive():
+            self.maintenance_thread.join(timeout=5.0)
+        
+        # Final session update if active
+        if self.current_session:
+            self.current_session.status = "interrupted"
+            self.current_session.end_time = time.time()
+            self.update_session(self.current_session)
+        
+        self.logger.info("Storage plugin cleaned up")
+
+
+
+
+# Factory function
+def create_storage_plugin(config_path: str = "config/plugins_config.yaml") -> StoragePlugin:
+    """Create storage plugin with configuration"""
+    try:
+        import yaml
+        with open(config_path, 'r') as f:
+            config_dict = yaml.safe_load(f)
+        
+        storage_dict = config_dict.get('plugins', {}).get('storage', {})
+        config = StorageConfig(**storage_dict)
+        
+        return StoragePlugin(config)
+        
+    except Exception as e:
+        logging.warning(f"Error loading storage config: {e}, using defaults")
+        return StoragePlugin(StorageConfig())
+
+
+
+
+# Database utility functions for other plugins
+def get_database_connection(db_path: str = "data/eden_pipeline.db"):
+    """Get database connection for other plugins"""
+    storage_plugin = create_storage_plugin()
+    return storage_plugin.db_manager.get_connection()
+
+
+
+
+def execute_query(query: str, params: tuple = (), db_path: str = "data/eden_pipeline.db"):
+    """Execute query for other plugins"""
+    storage_plugin = create_storage_plugin()
+    return storage_plugin.db_manager.execute_query(query, params)
+
+
+
+
+if __name__ == "__main__":
+    # Test the storage plugin
+    logging.basicConfig(level=logging.INFO)
+    
+    # Create storage plugin
+    plugin = create_storage_plugin()
+    
+    print(f"Storage plugin created: {plugin.name}")
+    print(f"Enabled: {plugin.enabled}")
+    
+    # Test session lifecycle
+    session_id = "test_session_storage_123"
+    plugin.on_recording_started(session_id)
+    
+    # Simulate some audio chunks and operations
+    import numpy as np
+    
+    for i in range(10):
+        chunk = AudioChunk(
+            data=np.random.random(1024).astype(np.float32),
+            timestamp=time.time(),
+            sample_rate=16000,
+            speaker_id=f"speaker_{i%3:03d}",
+            consent_token="CT-test123",
+            session_id=session_id,
+            is_speech=True
+        )
+        
+        plugin.process_audio(chunk)
+        
+        # Log some files
+        if i % 3 == 0:
+            plugin.log_file(
+                session_id, 
+                f"test_file_{i}.wav", 
+                "raw_audio", 
+                chunk.speaker_id, 
+                chunk.consent_token
+            )
+        
+        time.sleep(0.1)
+    
+    # Test speaker detection
+    plugin.on_speaker_detected("speaker_001", session_id)
+    plugin.on_speaker_detected("speaker_002", session_id)
+    
+    # Get statistics
+    stats = plugin.get_storage_statistics()
+    print(f"\nStorage Statistics:")
+    print(f"Sessions: {stats.get('sessions', {})}")
+    print(f"Speakers: {stats.get('speakers', {})}")
+    print(f"Files: {stats.get('files', {})}")
+    
+    # Test consent report
+    consent_report = plugin.get_consent_status_report()
+    print(f"\nConsent Report: {consent_report}")
+    
+    # Stop session
+    plugin.on_recording_stopped(session_id)
+    
+    # Export session data
+    plugin.export_session_data(session_id, "test_export")
+    
+    # Cleanup
+    plugin.cleanup()
+    
+    print("Storage plugin test completed")
