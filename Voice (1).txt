@@ -1,0 +1,1815 @@
+"""
+Eden Voiceprint Plugin
+Real-time voice embedding extraction for wallet-based data discovery.
+Generates consistent voiceprints that serve as keys for cross-session data retrieval.
+
+File: src/plugins/voiceprint/plugin.py
+"""
+
+import os
+import time
+import json
+import logging
+import threading
+import queue
+import hashlib
+from typing import Dict, List, Optional, Any, Tuple
+from dataclasses import dataclass, field
+from pathlib import Path
+import numpy as np
+import torch
+import torchaudio
+from collections import deque
+import sqlite3
+from datetime import datetime
+
+# SpeechBrain imports
+try:
+    from speechbrain.pretrained import EncoderClassifier
+    SPEECHBRAIN_AVAILABLE = True
+except ImportError:
+    SPEECHBRAIN_AVAILABLE = False
+    logging.warning("SpeechBrain not available, voiceprint extraction will be disabled")
+
+from src.core.audio_recorder import AudioChunk, PluginInterface
+
+
+@dataclass
+class VoiceprintConfig:
+    """Configuration for voiceprint plugin"""
+    enabled: bool = True
+    model_name: str = "speechbrain/spkrec-ecapa-voxceleb"
+    device: str = "cuda"  # cuda or cpu
+    
+    # Embedding settings
+    embedding_dimension: int = 192  # ECAPA-TDNN output size
+    min_audio_duration: float = 2.0  # Minimum seconds for reliable voiceprint
+    max_audio_duration: float = 10.0  # Maximum seconds to process
+    
+    # Consistency settings
+    normalization: bool = True
+    mean_normalization: bool = True
+    voice_activity_threshold: float = 0.5
+    
+    # Matching settings
+    similarity_threshold: float = 0.85  # Cosine similarity for matches
+    confidence_threshold: float = 0.80  # Minimum confidence for storage
+    max_candidates: int = 5  # Max similar voiceprints to return
+    
+    # Storage settings
+    embedding_storage_path: str = "data/voiceprints"
+    enable_clustering: bool = True
+    cluster_update_interval: int = 100  # Update clusters every N voiceprints
+
+
+@dataclass
+class VoiceprintEmbedding:
+    """Individual voiceprint embedding with metadata"""
+    embedding_id: str
+    speaker_id: str
+    session_id: str
+    embedding_vector: np.ndarray
+    confidence: float
+    extraction_timestamp: float
+    audio_duration: float
+    consent_token: str
+    model_version: str
+    normalization_applied: bool = True
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for storage (excluding embedding vector)"""
+        return {
+            'embedding_id': self.embedding_id,
+            'speaker_id': self.speaker_id,
+            'session_id': self.session_id,
+            'confidence': self.confidence,
+            'extraction_timestamp': self.extraction_timestamp,
+            'audio_duration': self.audio_duration,
+            'consent_token': self.consent_token,
+            'model_version': self.model_version,
+            'normalization_applied': self.normalization_applied,
+            'metadata': self.metadata
+        }
+
+
+@dataclass
+class VoiceprintMatch:
+    """Voiceprint match result for wallet queries"""
+    speaker_id: str
+    confidence: float
+    similarity_score: float
+    embedding_id: str
+    session_ids: List[str]
+    consent_tokens: List[str]
+    data_summary: Dict[str, Any]
+    last_activity: float
+
+
+class SpeechBrainEmbedder:
+    """SpeechBrain-based voice embedding extraction"""
+    
+    def __init__(self, model_name: str, device: str = "cuda"):
+        self.model_name = model_name
+        self.device = device if torch.cuda.is_available() else "cpu"
+        self.model = None
+        self.logger = logging.getLogger(__name__)
+        
+        if SPEECHBRAIN_AVAILABLE:
+            self._load_model()
+        else:
+            self.logger.error("SpeechBrain not available - voiceprint extraction disabled")
+    
+    def _load_model(self):
+        """Load SpeechBrain embedding model"""
+        try:
+            self.logger.info(f"Loading SpeechBrain model: {self.model_name} on {self.device}")
+            
+            # Load the pre-trained model
+            self.model = EncoderClassifier.from_hparams(
+                source=self.model_name,
+                run_opts={"device": self.device}
+            )
+            
+            self.logger.info("SpeechBrain model loaded successfully")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to load SpeechBrain model: {e}")
+            self.model = None
+    
+    def extract_embedding(self, audio_data: np.ndarray, sample_rate: int = 16000) -> Optional[np.ndarray]:
+        """
+        Extract voice embedding from audio data
+        Returns: embedding vector or None if extraction fails
+        """
+        if not self.model:
+            return None
+        
+        try:
+            # Convert to torch tensor
+            if audio_data.dtype != np.float32:
+                audio_data = audio_data.astype(np.float32)
+            
+            # Ensure proper shape for SpeechBrain (1, samples)
+            if len(audio_data.shape) == 1:
+                audio_tensor = torch.FloatTensor(audio_data).unsqueeze(0)
+            else:
+                audio_tensor = torch.FloatTensor(audio_data)
+            
+            # Move to device
+            audio_tensor = audio_tensor.to(self.device)
+            
+            # Extract embedding
+            with torch.no_grad():
+                embeddings = self.model.encode_batch(audio_tensor)
+                
+                # Get the embedding vector
+                if isinstance(embeddings, tuple):
+                    embedding = embeddings[0]  # Take first element if tuple
+                else:
+                    embedding = embeddings
+                
+                # Convert to numpy
+                embedding_np = embedding.squeeze().cpu().numpy()
+                
+                return embedding_np
+                
+        except Exception as e:
+            self.logger.error(f"Embedding extraction failed: {e}")
+            return None
+    
+    def get_model_info(self) -> Dict[str, str]:
+        """Get model information"""
+        return {
+            'model_name': self.model_name,
+            'device': self.device,
+            'available': self.model is not None,
+            'embedding_dim': 192  # ECAPA-TDNN standard output
+        }
+
+
+class VoiceprintMatcher:
+    """Handles voiceprint matching and similarity calculations"""
+    
+    def __init__(self, similarity_threshold: float = 0.85):
+        self.similarity_threshold = similarity_threshold
+        self.logger = logging.getLogger(__name__)
+    
+    def cosine_similarity(self, embedding1: np.ndarray, embedding2: np.ndarray) -> float:
+        """Calculate cosine similarity between two embeddings"""
+        try:
+            # Normalize vectors
+            norm1 = np.linalg.norm(embedding1)
+            norm2 = np.linalg.norm(embedding2)
+            
+            if norm1 == 0 or norm2 == 0:
+                return 0.0
+            
+            # Calculate cosine similarity
+            similarity = np.dot(embedding1, embedding2) / (norm1 * norm2)
+            
+            # Clamp to [-1, 1] range
+            return float(np.clip(similarity, -1.0, 1.0))
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating cosine similarity: {e}")
+            return 0.0
+    
+    def find_matches(self, query_embedding: np.ndarray, 
+                    stored_embeddings: List[VoiceprintEmbedding],
+                    max_candidates: int = 5) -> List[Tuple[VoiceprintEmbedding, float]]:
+        """
+        Find matching voiceprints for a query embedding
+        Returns: List of (embedding, similarity_score) tuples sorted by similarity
+        """
+        matches = []
+        
+        for stored_embedding in stored_embeddings:
+            try:
+                similarity = self.cosine_similarity(query_embedding, stored_embedding.embedding_vector)
+                
+                if similarity >= self.similarity_threshold:
+                    matches.append((stored_embedding, similarity))
+                    
+            except Exception as e:
+                self.logger.error(f"Error matching embedding {stored_embedding.embedding_id}: {e}")
+                continue
+        
+        # Sort by similarity (highest first) and limit results
+        matches.sort(key=lambda x: x[1], reverse=True)
+        return matches[:max_candidates]
+    
+    def normalize_embedding(self, embedding: np.ndarray, apply_mean_norm: bool = True) -> np.ndarray:
+        """
+        Normalize embedding for consistent matching
+        """
+        try:
+            normalized = embedding.copy()
+            
+            # L2 normalization
+            norm = np.linalg.norm(normalized)
+            if norm > 0:
+                normalized = normalized / norm
+            
+            # Mean normalization (center around zero)
+            if apply_mean_norm:
+                normalized = normalized - np.mean(normalized)
+                # Re-normalize after mean centering
+                norm = np.linalg.norm(normalized)
+                if norm > 0:
+                    normalized = normalized / norm
+            
+            return normalized
+            
+        except Exception as e:
+            self.logger.error(f"Error normalizing embedding: {e}")
+            return embedding
+
+
+class VoiceprintStorage:
+    """Handles voiceprint storage and retrieval operations"""
+    
+    def __init__(self, storage_path: str, database_manager=None):
+        self.storage_path = Path(storage_path)
+        self.storage_path.mkdir(parents=True, exist_ok=True)
+        self.db_manager = database_manager
+        self.logger = logging.getLogger(__name__)
+        
+        # In-memory cache for fast matching
+        self.embedding_cache: Dict[str, VoiceprintEmbedding] = {}
+        self._load_cache()
+    
+    def _load_cache(self):
+        """Load embeddings into memory cache for fast matching"""
+        try:
+            if not self.db_manager:
+                return
+            
+            # Get all voiceprints from database
+            voiceprints = self.db_manager.execute_query('''
+                SELECT * FROM voiceprints 
+                WHERE embedding_data IS NOT NULL
+                ORDER BY created_at DESC
+                LIMIT 10000
+            ''')
+            
+            for row in voiceprints:
+                try:
+                    # Load embedding from file
+                    embedding_file = self.storage_path / f"{row['voiceprint_id']}.npy"
+                    if embedding_file.exists():
+                        embedding_vector = np.load(embedding_file)
+                        
+                        # Create embedding object
+                        embedding_obj = VoiceprintEmbedding(
+                            embedding_id=str(row['voiceprint_id']),
+                            speaker_id=row['speaker_id'],
+                            session_id="",  # Not stored in this table
+                            embedding_vector=embedding_vector,
+                            confidence=row['confidence'] or 1.0,
+                            extraction_timestamp=row['extraction_timestamp'],
+                            audio_duration=0.0,  # Not stored
+                            consent_token="",  # Not stored
+                            model_version=row['model_version'] or "unknown",
+                            metadata=json.loads(row['metadata']) if row['metadata'] else {}
+                        )
+                        
+                        self.embedding_cache[str(row['voiceprint_id'])] = embedding_obj
+                        
+                except Exception as e:
+                    self.logger.warning(f"Error loading cached embedding {row['voiceprint_id']}: {e}")
+                    continue
+            
+            self.logger.info(f"Loaded {len(self.embedding_cache)} voiceprints into cache")
+            
+        except Exception as e:
+            self.logger.error(f"Error loading embedding cache: {e}")
+    
+    def store_embedding(self, embedding: VoiceprintEmbedding) -> bool:
+        """Store voiceprint embedding to database and file system"""
+        try:
+            # Save embedding vector to file
+            embedding_file = self.storage_path / f"{embedding.embedding_id}.npy"
+            np.save(embedding_file, embedding.embedding_vector)
+            
+            # Store metadata in database
+            if self.db_manager:
+                verification_hash = hashlib.sha256(embedding.embedding_vector.tobytes()).hexdigest()
+                
+                self.db_manager.execute_update('''
+                    INSERT INTO voiceprints 
+                    (speaker_id, embedding_data, model_version, extraction_timestamp,
+                     confidence, verification_hash, metadata)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    embedding.speaker_id,
+                    str(embedding_file),  # Path to embedding file
+                    embedding.model_version,
+                    embedding.extraction_timestamp,
+                    embedding.confidence,
+                    verification_hash,
+                    json.dumps(embedding.metadata)
+                ))
+            
+            # Add to cache
+            self.embedding_cache[embedding.embedding_id] = embedding
+            
+            self.logger.debug(f"Stored voiceprint embedding: {embedding.embedding_id}")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error storing embedding: {e}")
+            return False
+    
+    def get_all_embeddings(self) -> List[VoiceprintEmbedding]:
+        """Get all cached embeddings for matching"""
+        return list(self.embedding_cache.values())
+    
+    def get_embeddings_for_speaker(self, speaker_id: str) -> List[VoiceprintEmbedding]:
+        """Get all embeddings for a specific speaker"""
+        return [
+            emb for emb in self.embedding_cache.values() 
+            if emb.speaker_id == speaker_id
+        ]
+    
+    def cleanup_old_embeddings(self, days_old: int = 90):
+        """Clean up old embedding files"""
+        try:
+            cutoff_time = time.time() - (days_old * 24 * 3600)
+            
+            for embedding_file in self.storage_path.glob("*.npy"):
+                if embedding_file.stat().st_mtime < cutoff_time:
+                    embedding_file.unlink()
+                    self.logger.debug(f"Cleaned up old embedding file: {embedding_file}")
+                    
+        except Exception as e:
+            self.logger.error(f"Error cleaning up old embeddings: {e}")
+
+
+class AudioBuffer:
+    """Buffers audio for voiceprint extraction"""
+    
+    def __init__(self, min_duration: float = 2.0, max_duration: float = 10.0, 
+                 sample_rate: int = 16000):
+        self.min_duration = min_duration
+        self.max_duration = max_duration
+        self.sample_rate = sample_rate
+        
+        self.min_samples = int(min_duration * sample_rate)
+        self.max_samples = int(max_duration * sample_rate)
+        
+        self.audio_buffer = np.array([], dtype=np.float32)
+        self.speech_buffer = np.array([], dtype=np.float32)  # Only speech segments
+        self.buffer_start_time = None
+        
+        self.lock = threading.Lock()
+        self.logger = logging.getLogger(__name__)
+    
+    def add_audio(self, audio_data: np.ndarray, is_speech: bool, timestamp: float) -> bool:
+        """
+        Add audio data to buffer
+        Returns True if buffer is ready for processing
+        """
+        with self.lock:
+            if self.buffer_start_time is None:
+                self.buffer_start_time = timestamp
+            
+            # Add to main buffer
+            self.audio_buffer = np.concatenate([self.audio_buffer, audio_data])
+            
+            # Add to speech buffer only if it's speech
+            if is_speech:
+                self.speech_buffer = np.concatenate([self.speech_buffer, audio_data])
+            
+            # Trim if too long
+            if len(self.audio_buffer) > self.max_samples:
+                excess = len(self.audio_buffer) - self.max_samples
+                self.audio_buffer = self.audio_buffer[excess:]
+                
+                # Also trim speech buffer proportionally
+                if len(self.speech_buffer) > self.max_samples:
+                    self.speech_buffer = self.speech_buffer[-self.max_samples:]
+            
+            # Check if ready for processing (enough speech content)
+            return len(self.speech_buffer) >= self.min_samples
+    
+    def get_audio_for_processing(self) -> Tuple[np.ndarray, float]:
+        """Get audio for voiceprint extraction"""
+        with self.lock:
+            # Prefer speech-only audio, fall back to full audio
+            if len(self.speech_buffer) >= self.min_samples:
+                audio_to_process = self.speech_buffer.copy()
+            elif len(self.audio_buffer) >= self.min_samples:
+                audio_to_process = self.audio_buffer.copy()
+            else:
+                return np.array([]), 0.0
+            
+            duration = len(audio_to_process) / self.sample_rate
+            return audio_to_process, duration
+    
+    def clear_buffer(self):
+        """Clear the audio buffer"""
+        with self.lock:
+            self.audio_buffer = np.array([], dtype=np.float32)
+            self.speech_buffer = np.array([], dtype=np.float32)
+            self.buffer_start_time = None
+    
+    def get_buffer_status(self) -> Dict[str, Any]:
+        """Get current buffer status"""
+        with self.lock:
+            return {
+                'total_samples': len(self.audio_buffer),
+                'speech_samples': len(self.speech_buffer),
+                'total_duration': len(self.audio_buffer) / self.sample_rate,
+                'speech_duration': len(self.speech_buffer) / self.sample_rate,
+                'ready_for_processing': len(self.speech_buffer) >= self.min_samples
+            }
+
+
+class VoiceprintPlugin:
+    """Main voiceprint plugin implementing PluginInterface"""
+    
+    def __init__(self, config: VoiceprintConfig, storage_plugin=None):
+        self.config = config
+        self.storage_plugin = storage_plugin
+        self._enabled = config.enabled and SPEECHBRAIN_AVAILABLE
+        
+        # Core components
+        self.embedder = None
+        self.matcher = VoiceprintMatcher(config.similarity_threshold)
+        self.storage = VoiceprintStorage(config.embedding_storage_path, 
+                                       storage_plugin.db_manager if storage_plugin else None)
+        
+        # Audio buffers per speaker
+        self.audio_buffers: Dict[str, AudioBuffer] = {}
+        
+        # Current session tracking
+        self.current_session: Optional[str] = None
+        self.embedding_counter = 0
+        
+        # Processing queues
+        self.extraction_queue = queue.Queue()
+        self.extraction_thread = None
+        self.running = threading.Event()
+        
+        # Callbacks for wallet API
+        self.callbacks: Dict[str, List] = {
+            'voiceprint_extracted': [],
+            'match_found': [],
+            'extraction_error': []
+        }
+        
+        self.logger = logging.getLogger(__name__)
+        
+        # Initialize embedder
+        if self.enabled:
+            self._initialize_embedder()
+    
+    @property
+    def name(self) -> str:
+        return "VoiceprintPlugin"
+    
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+    
+    def _initialize_embedder(self):
+        """Initialize SpeechBrain embedder"""
+        try:
+            self.embedder = SpeechBrainEmbedder(
+                self.config.model_name,
+                self.config.device
+            )
+            
+            if self.embedder.model:
+                self.logger.info("SpeechBrain embedder initialized successfully")
+            else:
+                self._enabled = False
+                
+        except Exception as e:
+            self.logger.error(f"Failed to initialize embedder: {e}")
+            self._enabled = False
+    
+    def process_audio(self, chunk: AudioChunk) -> Optional[AudioChunk]:
+        """Process audio chunk for voiceprint extraction (transparent to other plugins)"""
+        if not self.enabled or not self.current_session:
+            return chunk
+        
+        try:
+            # Only process if we have a speaker ID and speech
+            if not chunk.speaker_id or not chunk.is_speech:
+                return chunk
+            
+            # Get or create audio buffer for this speaker
+            if chunk.speaker_id not in self.audio_buffers:
+                self.audio_buffers[chunk.speaker_id] = AudioBuffer(
+                    self.config.min_audio_duration,
+                    self.config.max_audio_duration,
+                    chunk.sample_rate
+                )
+            
+            buffer = self.audio_buffers[chunk.speaker_id]
+            
+            # Add audio to buffer
+            if buffer.add_audio(chunk.data, chunk.is_speech, chunk.timestamp):
+                # Buffer is ready for processing
+                self._queue_extraction(chunk.speaker_id, chunk.session_id, chunk.consent_token)
+            
+        except Exception as e:
+            self.logger.error(f"Error processing audio chunk: {e}")
+        
+        # Return chunk unchanged (transparent operation)
+        return chunk
+    
+    def on_recording_started(self, session_id: str) -> None:
+        """Initialize voiceprint extraction for new session"""
+        try:
+            self.logger.info(f"Starting voiceprint extraction for session: {session_id}")
+            
+            self.current_session = session_id
+            self.embedding_counter = 0
+            self.audio_buffers.clear()
+            
+            # Start extraction thread
+            self.running.set()
+            self.extraction_thread = threading.Thread(
+                target=self._extraction_worker,
+                daemon=True,
+                name="VoiceprintExtractor"
+            )
+            self.extraction_thread.start()
+            
+        except Exception as e:
+            self.logger.error(f"Failed to start voiceprint extraction: {e}")
+    
+    def on_recording_stopped(self, session_id: str) -> None:
+        """Finalize voiceprint extraction for completed session"""
+        try:
+            self.logger.info(f"Stopping voiceprint extraction for session: {session_id}")
+            
+            # Process any remaining audio in buffers
+            self._process_remaining_buffers()
+            
+            # Stop extraction thread
+            self.running.clear()
+            if self.extraction_thread and self.extraction_thread.is_alive():
+                self.extraction_thread.join(timeout=3.0)
+            
+            self.current_session = None
+            
+        except Exception as e:
+            self.logger.error(f"Failed to stop voiceprint extraction: {e}")
+    
+    def on_speaker_detected(self, speaker_id: str, session_id: str) -> None:
+        """Handle new speaker detection"""
+        if not self.enabled:
+            return
+        
+        try:
+            # Create audio buffer for new speaker
+            if speaker_id not in self.audio_buffers:
+                self.audio_buffers[speaker_id] = AudioBuffer(
+                    self.config.min_audio_duration,
+                    self.config.max_audio_duration,
+                    16000  # Default sample rate
+                )
+            
+            self.logger.info(f"Speaker {speaker_id} initialized for voiceprint extraction")
+            
+        except Exception as e:
+            self.logger.error(f"Error handling speaker detection: {e}")
+    
+    def _queue_extraction(self, speaker_id: str, session_id: str, consent_token: str):
+        """Queue audio for voiceprint extraction"""
+        try:
+            self.extraction_queue.put({
+                'speaker_id': speaker_id,
+                'session_id': session_id,
+                'consent_token': consent_token,
+                'timestamp': time.time()
+            }, block=False)
+        except queue.Full:
+            self.logger.warning("Voiceprint extraction queue full, dropping audio")
+    
+    def _extraction_worker(self):
+        """Background worker for voiceprint extraction"""
+        while self.running.is_set():
+            try:
+                # Get extraction task
+                try:
+                    task = self.extraction_queue.get(timeout=1.0)
+                except queue.Empty:
+                    continue
+                
+                speaker_id = task['speaker_id']
+                
+                # Get audio from buffer
+                if speaker_id in self.audio_buffers:
+                    audio_data, duration = self.audio_buffers[speaker_id].get_audio_for_processing()
+                    
+                    if len(audio_data) > 0 and duration >= self.config.min_audio_duration:
+                        # Extract voiceprint
+                        self._extract_voiceprint(
+                            audio_data,
+                            speaker_id,
+                            task['session_id'],
+                            task['consent_token'],
+                            duration
+                        )
+                
+                self.extraction_queue.task_done()
+                
+            except Exception as e:
+                self.logger.error(f"Extraction worker error: {e}")
+                time.sleep(0.1)
+    
+    def _extract_voiceprint(self, audio_data: np.ndarray, speaker_id: str, 
+                          session_id: str, consent_token: str, duration: float):
+        """Extract voiceprint from audio data"""
+        try:
+            # Extract embedding
+            raw_embedding = self.embedder.extract_embedding(audio_data)
+            
+            if raw_embedding is None:
+                self.logger.warning(f"Failed to extract embedding for speaker {speaker_id}")
+                return
+            
+            # Normalize embedding
+            if self.config.normalization:
+                normalized_embedding = self.matcher.normalize_embedding(
+                    raw_embedding, 
+                    self.config.mean_normalization
+                )
+            else:
+                normalized_embedding = raw_embedding
+            
+            # Calculate confidence (based on embedding magnitude and consistency)
+            confidence = self._calculate_confidence(normalized_embedding, duration)
+            
+            if confidence < self.config.confidence_threshold:
+                self.logger.debug(f"Low confidence voiceprint for speaker {speaker_id}: {confidence:.3f}")
+                return
+            
+            # Create embedding object
+            self.embedding_counter += 1
+            embedding_id = f"{session_id}_{speaker_id}_{self.embedding_counter}_{int(time.time())}"
+            
+            embedding = VoiceprintEmbedding(
+                embedding_id=embedding_id,
+                speaker_id=speaker_id,
+                session_id=session_id,
+                embedding_vector=normalized_embedding,
+                confidence=confidence,
+                extraction_timestamp=time.time(),
+                audio_duration=duration,
+                consent_token=consent_token,
+                model_version=self.embedder.model_name,
+                normalization_applied=self.config.normalization,
+                metadata={
+                    'extraction_method': 'real_time',
+                    'audio_samples': len(audio_data),
+                    'embedding_dimension': len(normalized_embedding)
+                }
+            )
+            
+            # Store embedding
+            if self.storage.store_embedding(embedding):
+                self.logger.info(f"Extracted voiceprint for speaker {speaker_id} (confidence: {confidence:.3f})")
+                
+                # Trigger callbacks
+                self._trigger_callback('voiceprint_extracted', {
+                    'embedding_id': embedding_id,
+                    'speaker_id': speaker_id,
+                    'confidence': confidence,
+                    'session_id': session_id
+                })
+            
+        except Exception as e:
+            self.logger.error(f"Error extracting voiceprint for speaker {speaker_id}: {e}")
+            self._trigger_callback('extraction_error', {
+                'speaker_id': speaker_id,
+                'error': str(e)
+            })
+    
+    def _calculate_confidence(self, embedding: np.ndarray, duration: float) -> float:
+        """Calculate confidence score for voiceprint quality"""
+        try:
+            # Base confidence from embedding properties
+            embedding_magnitude = np.linalg.norm(embedding)
+            embedding_variance = np.var(embedding)
+            
+            # Duration factor (longer audio = higher confidence)
+            duration_factor = min(duration / self.config.max_audio_duration, 1.0)
+            
+            # Embedding quality factors
+            magnitude_factor = min(embedding_magnitude / 10.0, 1.0)  # Normalize to reasonable range
+            variance_factor = min(embedding_variance * 100, 1.0)  # Good embeddings have some variance
+            
+            # Combine factors
+            confidence = (duration_factor * 0.4 + 
+                         magnitude_factor * 0.3 + 
+                         variance_factor * 0.3)
+            
+            return float(np.clip(confidence, 0.0, 1.0))
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating confidence: {e}")
+            return 0.5  # Default moderate confidence
+    
+    def _process_remaining_buffers(self):
+        """Process any remaining audio in buffers before shutdown"""
+        try:
+            for speaker_id, buffer in self.audio_buffers.items():
+                audio_data, duration = buffer.get_audio_for_processing()
+                if len(audio_data) > 0:
+                    self._extract_voiceprint(
+                        audio_data,
+                        speaker_id,
+                        self.current_session or "session_end",
+                        "session_end",
+                        duration
+                    )
+        except Exception as e:
+            self.logger.error(f"Error processing remaining buffers: {e}")
+    
+    # Wallet API Methods
+    
+    def query_voiceprint(self, query_audio: np.ndarray, sample_rate: int = 16000) -> List[VoiceprintMatch]:
+        """
+        Query for matching voiceprints (wallet API endpoint)
+        Used when wallet opens with voice authentication
+        """
+        try:
+            if not self.embedder or not self.embedder.model:
+                self.logger.error("Embedder not available for voiceprint query")
+                return []
+            
+            # Extract embedding from query audio
+            query_embedding = self.embedder.extract_embedding(query_audio, sample_rate)
+            if query_embedding is None:
+                self.logger.warning("Failed to extract embedding from query audio")
+                return []
+            
+            # Normalize query embedding
+            if self.config.normalization:
+                query_embedding = self.matcher.normalize_embedding(
+                    query_embedding, 
+                    self.config.mean_normalization
+                )
+            
+            # Find matches
+            stored_embeddings = self.storage.get_all_embeddings()
+            matches = self.matcher.find_matches(
+                query_embedding, 
+                stored_embeddings, 
+                self.config.max_candidates
+            )
+            
+            # Group matches by speaker and create response
+            speaker_matches = {}
+            for embedding, similarity in matches:
+                speaker_id = embedding.speaker_id
+                
+                if speaker_id not in speaker_matches:
+                    speaker_matches[speaker_id] = {
+                        'embeddings': [],
+                        'similarities': [],
+                        'sessions': set(),
+                        'consent_tokens': set(),
+                        'max_similarity': 0.0,
+                        'last_activity': 0.0
+                    }
+                
+                speaker_matches[speaker_id]['embeddings'].append(embedding)
+                speaker_matches[speaker_id]['similarities'].append(similarity)
+                speaker_matches[speaker_id]['sessions'].add(embedding.session_id)
+                speaker_matches[speaker_id]['consent_tokens'].add(embedding.consent_token)
+                speaker_matches[speaker_id]['max_similarity'] = max(
+                    speaker_matches[speaker_id]['max_similarity'], similarity
+                )
+                speaker_matches[speaker_id]['last_activity'] = max(
+                    speaker_matches[speaker_id]['last_activity'], 
+                    embedding.extraction_timestamp
+                )
+            
+            # Create VoiceprintMatch objects
+            voiceprint_matches = []
+            for speaker_id, match_data in speaker_matches.items():
+                # Get data summary for this speaker
+                data_summary = self._get_speaker_data_summary(speaker_id)
+                
+                # Calculate overall confidence (average of top similarities)
+                top_similarities = sorted(match_data['similarities'], reverse=True)[:3]
+                avg_confidence = np.mean(top_similarities) if top_similarities else 0.0
+                
+                match = VoiceprintMatch(
+                    speaker_id=speaker_id,
+                    confidence=avg_confidence,
+                    similarity_score=match_data['max_similarity'],
+                    embedding_id=match_data['embeddings'][0].embedding_id,  # Most recent
+                    session_ids=list(match_data['sessions']),
+                    consent_tokens=list(match_data['consent_tokens']),
+                    data_summary=data_summary,
+                    last_activity=match_data['last_activity']
+                )
+                
+                voiceprint_matches.append(match)
+            
+            # Sort by confidence and return
+            voiceprint_matches.sort(key=lambda x: x.confidence, reverse=True)
+            
+            self.logger.info(f"Voiceprint query returned {len(voiceprint_matches)} matches")
+            return voiceprint_matches
+            
+        except Exception as e:
+            self.logger.error(f"Error querying voiceprint: {e}")
+            return []
+    
+    def _get_speaker_data_summary(self, speaker_id: str) -> Dict[str, Any]:
+        """Get summary of all data associated with a speaker"""
+        try:
+            if not self.storage_plugin:
+                return {}
+            
+            db = self.storage_plugin.db_manager
+            
+            # Get session count
+            sessions = db.execute_query(
+                'SELECT COUNT(DISTINCT session_id) as count FROM audio_chunks WHERE speaker_id = ?',
+                (speaker_id,)
+            )
+            session_count = sessions[0]['count'] if sessions else 0
+            
+            # Get file count
+            files = db.execute_query(
+                'SELECT COUNT(*) as count FROM files WHERE speaker_id = ? AND deleted_at IS NULL',
+                (speaker_id,)
+            )
+            file_count = files[0]['count'] if files else 0
+            
+            # Get transcript count
+            transcripts = db.execute_query(
+                'SELECT COUNT(*) as count FROM transcripts WHERE speaker_id = ?',
+                (speaker_id,)
+            )
+            transcript_count = transcripts[0]['count'] if transcripts else 0
+            
+            # Get consent status
+            consent_tokens = db.execute_query(
+                'SELECT current_status FROM consent_tokens WHERE speaker_id = ? ORDER BY granted_timestamp DESC LIMIT 1',
+                (speaker_id,)
+            )
+            consent_status = consent_tokens[0]['current_status'] if consent_tokens else 'unknown'
+            
+            # Get total speech time
+            speech_time = db.execute_query(
+                'SELECT SUM(duration) as total FROM audio_chunks WHERE speaker_id = ? AND is_speech = 1',
+                (speaker_id,)
+            )
+            total_speech_time = speech_time[0]['total'] if speech_time and speech_time[0]['total'] else 0.0
+            
+            return {
+                'session_count': session_count,
+                'file_count': file_count,
+                'transcript_count': transcript_count,
+                'consent_status': consent_status,
+                'total_speech_time': total_speech_time,
+                'data_available': session_count > 0 or file_count > 0
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error getting speaker data summary: {e}")
+            return {}
+    
+    def get_speaker_consent_tokens(self, speaker_id: str) -> List[Dict[str, Any]]:
+        """Get all consent tokens for a speaker (wallet API)"""
+        try:
+            if not self.storage_plugin:
+                return []
+            
+            consent_tokens = self.storage_plugin.db_manager.execute_query('''
+                SELECT token_id, current_status, granted_timestamp, revoked_timestamp,
+                       grace_expires, consent_data
+                FROM consent_tokens 
+                WHERE speaker_id = ? 
+                ORDER BY granted_timestamp DESC
+            ''', (speaker_id,))
+            
+            result = []
+            for token in consent_tokens:
+                token_data = {
+                    'token_id': token['token_id'],
+                    'status': token['current_status'],
+                    'granted_at': datetime.fromtimestamp(token['granted_timestamp']).isoformat(),
+                    'revoked_at': datetime.fromtimestamp(token['revoked_timestamp']).isoformat() if token['revoked_timestamp'] else None,
+                    'grace_expires': datetime.fromtimestamp(token['grace_expires']).isoformat() if token['grace_expires'] else None
+                }
+                
+                # Parse additional consent data
+                if token['consent_data']:
+                    try:
+                        additional_data = json.loads(token['consent_data'])
+                        token_data.update(additional_data)
+                    except:
+                        pass
+                
+                result.append(token_data)
+            
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Error getting consent tokens for speaker {speaker_id}: {e}")
+            return []
+    
+    def get_speaker_sessions(self, speaker_id: str) -> List[Dict[str, Any]]:
+        """Get all sessions for a speaker (wallet API)"""
+        try:
+            if not self.storage_plugin:
+                return []
+            
+            sessions = self.storage_plugin.db_manager.execute_query('''
+                SELECT DISTINCT s.session_id, s.start_time, s.end_time, s.status,
+                       COUNT(ac.chunk_id) as chunk_count,
+                       SUM(CASE WHEN ac.is_speech THEN ac.duration ELSE 0 END) as speech_duration
+                FROM sessions s
+                JOIN audio_chunks ac ON s.session_id = ac.session_id
+                WHERE ac.speaker_id = ?
+                GROUP BY s.session_id
+                ORDER BY s.start_time DESC
+            ''', (speaker_id,))
+            
+            result = []
+            for session in sessions:
+                session_data = {
+                    'session_id': session['session_id'],
+                    'start_time': datetime.fromtimestamp(session['start_time']).isoformat(),
+                    'end_time': datetime.fromtimestamp(session['end_time']).isoformat() if session['end_time'] else None,
+                    'status': session['status'],
+                    'chunk_count': session['chunk_count'],
+                    'speech_duration': session['speech_duration'] or 0.0
+                }
+                result.append(session_data)
+            
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Error getting sessions for speaker {speaker_id}: {e}")
+            return []
+    
+    def get_speaker_files(self, speaker_id: str) -> List[Dict[str, Any]]:
+        """Get all files associated with a speaker (wallet API)"""
+        try:
+            if not self.storage_plugin:
+                return []
+            
+            files = self.storage_plugin.db_manager.execute_query('''
+                SELECT file_id, session_id, file_path, file_type, file_size,
+                       consent_token, created_at, archived_at, deleted_at
+                FROM files 
+                WHERE speaker_id = ? AND deleted_at IS NULL
+                ORDER BY created_at DESC
+            ''', (speaker_id,))
+            
+            result = []
+            for file_row in files:
+                file_data = {
+                    'file_id': file_row['file_id'],
+                    'session_id': file_row['session_id'],
+                    'file_path': file_row['file_path'],
+                    'file_type': file_row['file_type'],
+                    'file_size': file_row['file_size'],
+                    'consent_token': file_row['consent_token'],
+                    'created_at': datetime.fromtimestamp(file_row['created_at']).isoformat(),
+                    'archived': file_row['archived_at'] is not None,
+                    'available': file_row['deleted_at'] is None
+                }
+                result.append(file_data)
+            
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Error getting files for speaker {speaker_id}: {e}")
+            return []
+    
+    # Utility and management methods
+    
+    def get_voiceprint_statistics(self) -> Dict[str, Any]:
+        """Get voiceprint extraction statistics"""
+        try:
+            total_embeddings = len(self.storage.embedding_cache)
+            unique_speakers = len(set(emb.speaker_id for emb in self.storage.embedding_cache.values()))
+            
+            # Buffer status
+            buffer_status = {}
+            for speaker_id, buffer in self.audio_buffers.items():
+                buffer_status[speaker_id] = buffer.get_buffer_status()
+            
+            return {
+                'session_id': self.current_session,
+                'total_embeddings': total_embeddings,
+                'unique_speakers': unique_speakers,
+                'extraction_queue_size': self.extraction_queue.qsize(),
+                'active_buffers': len(self.audio_buffers),
+                'buffer_status': buffer_status,
+                'model_info': self.embedder.get_model_info() if self.embedder else {},
+                'config': {
+                    'similarity_threshold': self.config.similarity_threshold,
+                    'confidence_threshold': self.config.confidence_threshold,
+                    'min_audio_duration': self.config.min_audio_duration
+                }
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error getting voiceprint statistics: {e}")
+            return {}
+    
+    def update_similarity_threshold(self, new_threshold: float):
+        """Update similarity threshold for matching"""
+        if 0.0 <= new_threshold <= 1.0:
+            self.config.similarity_threshold = new_threshold
+            self.matcher.similarity_threshold = new_threshold
+            self.logger.info(f"Updated similarity threshold to {new_threshold}")
+        else:
+            self.logger.warning(f"Invalid similarity threshold: {new_threshold}")
+    
+    def rebuild_embedding_cache(self):
+        """Rebuild the embedding cache from database"""
+        try:
+            self.storage._load_cache()
+            self.logger.info("Embedding cache rebuilt successfully")
+        except Exception as e:
+            self.logger.error(f"Error rebuilding embedding cache: {e}")
+    
+    def add_callback(self, event_type: str, callback):
+        """Add callback for voiceprint events"""
+        if event_type in self.callbacks:
+            self.callbacks[event_type].append(callback)
+    
+    def _trigger_callback(self, event_type: str, data: Any):
+        """Trigger callbacks for voiceprint events"""
+        for callback in self.callbacks.get(event_type, []):
+            try:
+                callback(data)
+            except Exception as e:
+                self.logger.error(f"Callback error for {event_type}: {e}")
+    
+    def cleanup(self) -> None:
+        """Clean up voiceprint plugin resources"""
+        self.running.clear()
+        
+        if self.extraction_thread and self.extraction_thread.is_alive():
+            self.extraction_thread.join(timeout=3.0)
+        
+        # Clear buffers
+        for buffer in self.audio_buffers.values():
+            buffer.clear_buffer()
+        
+        self.audio_buffers.clear()
+        
+        # Cleanup old embeddings
+        self.storage.cleanup_old_embeddings()
+        
+        self.logger.info("Voiceprint plugin cleaned up")
+
+
+# Wallet API Interface
+
+class WalletAPI:
+    """API interface for wallet voice authentication and data discovery"""
+    
+    def __init__(self, voiceprint_plugin: VoiceprintPlugin):
+        self.voiceprint_plugin = voiceprint_plugin
+        self.logger = logging.getLogger(__name__)
+    
+    def authenticate_voice(self, voice_audio: np.ndarray, 
+                          sample_rate: int = 16000) -> Dict[str, Any]:
+        """
+        Main wallet authentication endpoint
+        Input: Voice audio from random phrase + background noise
+        Output: User data and consent status
+        """
+        try:
+            # Query voiceprints
+            matches = self.voiceprint_plugin.query_voiceprint(voice_audio, sample_rate)
+            
+            if not matches:
+                return {
+                    'authenticated': False,
+                    'reason': 'no_matches_found',
+                    'data': None
+                }
+            
+            # Get best match (highest confidence)
+            best_match = matches[0]
+            
+            if best_match.confidence < self.voiceprint_plugin.config.similarity_threshold:
+                return {
+                    'authenticated': False,
+                    'reason': 'low_confidence',
+                    'confidence': best_match.confidence,
+                    'data': None
+                }
+            
+            # Get comprehensive user data
+            user_data = self._compile_user_data(best_match)
+            
+            return {
+                'authenticated': True,
+                'confidence': best_match.confidence,
+                'speaker_id': best_match.speaker_id,
+                'data': user_data
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Voice authentication error: {e}")
+            return {
+                'authenticated': False,
+                'reason': 'authentication_error',
+                'error': str(e),
+                'data': None
+            }
+    
+    def _compile_user_data(self, match: VoiceprintMatch) -> Dict[str, Any]:
+        """Compile comprehensive user data for wallet display"""
+        try:
+            speaker_id = match.speaker_id
+            
+            # Get consent tokens
+            consent_tokens = self.voiceprint_plugin.get_speaker_consent_tokens(speaker_id)
+            
+            # Get sessions
+            sessions = self.voiceprint_plugin.get_speaker_sessions(speaker_id)
+            
+            # Get files
+            files = self.voiceprint_plugin.get_speaker_files(speaker_id)
+            
+            # Compile summary
+            user_data = {
+                'speaker_id': speaker_id,
+                'last_activity': datetime.fromtimestamp(match.last_activity).isoformat(),
+                'data_summary': match.data_summary,
+                'consent_management': {
+                    'total_tokens': len(consent_tokens),
+                    'active_tokens': len([t for t in consent_tokens if t['status'] == 'active']),
+                    'revoked_tokens': len([t for t in consent_tokens if t['status'] == 'revoked']),
+                    'tokens': consent_tokens
+                },
+                'sessions': {
+                    'total_sessions': len(sessions),
+                    'sessions': sessions[:10]  # Limit to recent 10
+                },
+                'files': {
+                    'total_files': len(files),
+                    'files': files[:20]  # Limit to recent 20
+                },
+                'voiceprint_info': {
+                    'match_confidence': match.confidence,
+                    'similarity_score': match.similarity_score,
+                    'embedding_id': match.embedding_id
+                }
+            }
+            
+            return user_data
+            
+        except Exception as e:
+            self.logger.error(f"Error compiling user data: {e}")
+            return {}
+    
+    def revoke_consent_token(self, speaker_id: str, token_id: str, 
+                           revoked_by: str = "wallet") -> Dict[str, Any]:
+        """Revoke a specific consent token via wallet"""
+        try:
+            # This would typically interface with the consent manager
+            # For now, we'll update the database directly
+            if not self.voiceprint_plugin.storage_plugin:
+                return {'success': False, 'error': 'Storage not available'}
+            
+            db = self.voiceprint_plugin.storage_plugin.db_manager
+            
+            # Update consent token status
+            affected_rows = db.execute_update('''
+                UPDATE consent_tokens 
+                SET current_status = 'revoked', 
+                    revoked_timestamp = ?, 
+                    updated_at = ?
+                WHERE token_id = ? AND speaker_id = ?
+            ''', (time.time(), time.time(), token_id, speaker_id))
+            
+            if affected_rows > 0:
+                self.logger.info(f"Consent token {token_id} revoked for speaker {speaker_id} via wallet")
+                return {'success': True, 'token_id': token_id, 'revoked_by': revoked_by}
+            else:
+                return {'success': False, 'error': 'Token not found or already revoked'}
+                
+        except Exception as e:
+            self.logger.error(f"Error revoking consent token: {e}")
+            return {'success': False, 'error': str(e)}
+    
+    def export_user_data(self, speaker_id: str, export_format: str = "json") -> Dict[str, Any]:
+        """Export all user data for download"""
+        try:
+            # Get comprehensive user data
+            consent_tokens = self.voiceprint_plugin.get_speaker_consent_tokens(speaker_id)
+            sessions = self.voiceprint_plugin.get_speaker_sessions(speaker_id)
+            files = self.voiceprint_plugin.get_speaker_files(speaker_id)
+            
+            # Get transcripts if available
+            transcripts = []
+            if self.voiceprint_plugin.storage_plugin:
+                transcript_data = self.voiceprint_plugin.storage_plugin.db_manager.execute_query('''
+                    SELECT * FROM transcripts WHERE speaker_id = ? ORDER BY timestamp DESC
+                ''', (speaker_id,))
+                
+                transcripts = [dict(row) for row in transcript_data]
+            
+            export_data = {
+                'export_info': {
+                    'speaker_id': speaker_id,
+                    'export_timestamp': datetime.now().isoformat(),
+                    'export_format': export_format
+                },
+                'consent_tokens': consent_tokens,
+                'sessions': sessions,
+                'files': files,
+                'transcripts': transcripts
+            }
+            
+            return {
+                'success': True,
+                'data': export_data,
+                'total_items': len(consent_tokens) + len(sessions) + len(files) + len(transcripts)
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error exporting user data: {e}")
+            return {'success': False, 'error': str(e)}
+
+
+# Factory and utility functions
+
+def create_voiceprint_plugin(config_path: str = "config/plugins_config.yaml",
+                           storage_plugin=None) -> VoiceprintPlugin:
+    """Create voiceprint plugin with configuration"""
+    try:
+        import yaml
+        with open(config_path, 'r') as f:
+            config_dict = yaml.safe_load(f)
+        
+        voiceprint_dict = config_dict.get('plugins', {}).get('voiceprint', {})
+        config = VoiceprintConfig(**voiceprint_dict)
+        
+        return VoiceprintPlugin(config, storage_plugin)
+        
+    except Exception as e:
+        logging.warning(f"Error loading voiceprint config: {e}, using defaults")
+        return VoiceprintPlugin(VoiceprintConfig(), storage_plugin)
+
+
+def test_voiceprint_extraction(audio_file_path: str, model_name: str = None) -> Dict[str, Any]:
+    """Test voiceprint extraction on audio file"""
+    try:
+        import librosa
+        
+        # Load audio file
+        audio_data, sample_rate = librosa.load(audio_file_path, sr=16000)
+        
+        # Initialize embedder
+        embedder = SpeechBrainEmbedder(
+            model_name or "speechbrain/spkrec-ecapa-voxceleb",
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+        
+        if not embedder.model:
+            return {'success': False, 'error': 'Failed to load SpeechBrain model'}
+        
+        # Extract embedding
+        embedding = embedder.extract_embedding(audio_data, sample_rate)
+        
+        if embedding is None:
+            return {'success': False, 'error': 'Failed to extract embedding'}
+        
+        # Calculate embedding statistics
+        embedding_stats = {
+            'dimension': len(embedding),
+            'magnitude': float(np.linalg.norm(embedding)),
+            'mean': float(np.mean(embedding)),
+            'std': float(np.std(embedding)),
+            'min': float(np.min(embedding)),
+            'max': float(np.max(embedding))
+        }
+        
+        return {
+            'success': True,
+            'file_path': audio_file_path,
+            'audio_duration': len(audio_data) / sample_rate,
+            'embedding_stats': embedding_stats,
+            'model_info': embedder.get_model_info()
+        }
+        
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
+
+
+def test_voiceprint_matching(audio_file1: str, audio_file2: str) -> Dict[str, Any]:
+    """Test voiceprint matching between two audio files"""
+    try:
+        import librosa
+        
+        # Load audio files
+        audio1, _ = librosa.load(audio_file1, sr=16000)
+        audio2, _ = librosa.load(audio_file2, sr=16000)
+        
+        # Initialize embedder
+        embedder = SpeechBrainEmbedder("speechbrain/spkrec-ecapa-voxceleb")
+        matcher = VoiceprintMatcher()
+        
+        if not embedder.model:
+            return {'success': False, 'error': 'Failed to load SpeechBrain model'}
+        
+        # Extract embeddings
+        embedding1 = embedder.extract_embedding(audio1)
+        embedding2 = embedder.extract_embedding(audio2)
+        
+        if embedding1 is None or embedding2 is None:
+            return {'success': False, 'error': 'Failed to extract embeddings'}
+        
+        # Normalize embeddings
+        norm_embedding1 = matcher.normalize_embedding(embedding1, True)
+        norm_embedding2 = matcher.normalize_embedding(embedding2, True)
+        
+        # Calculate similarities
+        raw_similarity = matcher.cosine_similarity(embedding1, embedding2)
+        normalized_similarity = matcher.cosine_similarity(norm_embedding1, norm_embedding2)
+        
+        return {
+            'success': True,
+            'file1': audio_file1,
+            'file2': audio_file2,
+            'raw_similarity': raw_similarity,
+            'normalized_similarity': normalized_similarity,
+            'match_result': normalized_similarity >= 0.85,
+            'confidence': 'high' if normalized_similarity >= 0.9 else 'medium' if normalized_similarity >= 0.85 else 'low'
+        }
+        
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
+
+
+class VoiceprintTestSuite:
+    """Comprehensive testing suite for voiceprint plugin"""
+    
+    def __init__(self):
+        self.logger = logging.getLogger(__name__)
+    
+    def test_speechbrain_availability(self) -> Dict[str, Any]:
+        """Test if SpeechBrain is available and working"""
+        try:
+            if not SPEECHBRAIN_AVAILABLE:
+                return {
+                    'success': False,
+                    'error': 'SpeechBrain not installed',
+                    'recommendation': 'pip install speechbrain'
+                }
+            
+            # Test model loading
+            embedder = SpeechBrainEmbedder("speechbrain/spkrec-ecapa-voxceleb", "cpu")
+            
+            if embedder.model is None:
+                return {
+                    'success': False,
+                    'error': 'Failed to load SpeechBrain model',
+                    'model_info': embedder.get_model_info()
+                }
+            
+            # Test embedding extraction
+            test_audio = np.random.random(16000).astype(np.float32)  # 1 second of random audio
+            embedding = embedder.extract_embedding(test_audio)
+            
+            if embedding is None:
+                return {
+                    'success': False,
+                    'error': 'Failed to extract embedding from test audio'
+                }
+            
+            return {
+                'success': True,
+                'model_info': embedder.get_model_info(),
+                'test_embedding_shape': embedding.shape,
+                'test_embedding_stats': {
+                    'mean': float(np.mean(embedding)),
+                    'std': float(np.std(embedding)),
+                    'magnitude': float(np.linalg.norm(embedding))
+                }
+            }
+            
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+    
+    def test_audio_buffer(self) -> Dict[str, Any]:
+        """Test audio buffering functionality"""
+        try:
+            buffer = AudioBuffer(min_duration=2.0, max_duration=5.0, sample_rate=16000)
+            
+            # Test adding audio chunks
+            chunk1 = np.random.random(8000).astype(np.float32)  # 0.5 seconds
+            chunk2 = np.random.random(16000).astype(np.float32)  # 1.0 seconds  
+            chunk3 = np.random.random(8000).astype(np.float32)  # 0.5 seconds
+            
+            ready1 = buffer.add_audio(chunk1, True, time.time())
+            ready2 = buffer.add_audio(chunk2, True, time.time() + 0.5)
+            ready3 = buffer.add_audio(chunk3, True, time.time() + 1.5)
+            
+            # Should be ready after chunk2 (2.0 seconds total speech)
+            if ready2 or ready3:
+                audio_data, duration = buffer.get_audio_for_processing()
+                
+                return {
+                    'success': True,
+                    'buffer_tests': {
+                        'ready_after_chunk1': ready1,
+                        'ready_after_chunk2': ready2,
+                        'ready_after_chunk3': ready3,
+                        'extracted_duration': duration,
+                        'extracted_samples': len(audio_data)
+                    },
+                    'buffer_status': buffer.get_buffer_status()
+                }
+            else:
+                return {'success': False, 'error': 'Buffer not ready when expected'}
+                
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+    
+    def test_embedding_storage(self) -> Dict[str, Any]:
+        """Test embedding storage and retrieval"""
+        try:
+            # Create temporary storage
+            import tempfile
+            temp_dir = tempfile.mkdtemp()
+            
+            storage = VoiceprintStorage(temp_dir)
+            
+            # Create test embedding
+            test_embedding = VoiceprintEmbedding(
+                embedding_id="test_123",
+                speaker_id="test_speaker",
+                session_id="test_session",
+                embedding_vector=np.random.random(192).astype(np.float32),
+                confidence=0.95,
+                extraction_timestamp=time.time(),
+                audio_duration=3.0,
+                consent_token="test_token",
+                model_version="test_model"
+            )
+            
+            # Test storage
+            stored = storage.store_embedding(test_embedding)
+            
+            if not stored:
+                return {'success': False, 'error': 'Failed to store embedding'}
+            
+            # Test retrieval
+            retrieved_embeddings = storage.get_all_embeddings()
+            
+            if len(retrieved_embeddings) == 0:
+                return {'success': False, 'error': 'No embeddings retrieved'}
+            
+            # Verify the embedding
+            retrieved = retrieved_embeddings[0]
+            
+            return {
+                'success': True,
+                'stored_embedding_id': test_embedding.embedding_id,
+                'retrieved_embedding_id': retrieved.embedding_id,
+                'embedding_match': np.allclose(test_embedding.embedding_vector, retrieved.embedding_vector),
+                'storage_path': temp_dir
+            }
+            
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+    
+    def run_all_tests(self) -> Dict[str, Any]:
+        """Run all voiceprint tests"""
+        self.logger.info("Running voiceprint plugin test suite...")
+        
+        results = {
+            'speechbrain_test': self.test_speechbrain_availability(),
+            'audio_buffer_test': self.test_audio_buffer(),
+            'embedding_storage_test': self.test_embedding_storage(),
+            'test_timestamp': time.time()
+        }
+        
+        # Calculate overall success
+        all_successful = all(
+            result.get('success', False) for result in results.values() 
+            if isinstance(result, dict) and 'success' in result
+        )
+        
+        results['overall_success'] = all_successful
+        results['summary'] = {
+            'speechbrain_available': results['speechbrain_test']['success'],
+            'audio_buffer_working': results['audio_buffer_test']['success'],
+            'storage_working': results['embedding_storage_test']['success']
+        }
+        
+        self.logger.info(f"Test suite completed. Overall success: {all_successful}")
+        return results
+
+
+if __name__ == "__main__":
+    # Test the voiceprint plugin
+    logging.basicConfig(level=logging.INFO)
+    
+    print("=== Eden Voiceprint Plugin Test Suite ===")
+    
+    # Run comprehensive tests
+    test_suite = VoiceprintTestSuite()
+    results = test_suite.run_all_tests()
+    
+    print(f"\n=== Test Results ===")
+    print(f"Overall Success: {results['overall_success']}")
+    print(f"SpeechBrain Available: {results['speechbrain_test']['success']}")
+    print(f"Audio Buffer Working: {results['audio_buffer_test']['success']}")
+    print(f"Embedding Storage Working: {results['embedding_storage_test']['success']}")
+    
+    if results['speechbrain_test']['success']:
+        print(f"Model Info: {results['speechbrain_test']['model_info']}")
+    
+    # Test plugin creation
+    print(f"\n=== Plugin Creation Test ===")
+    try:
+        plugin = create_voiceprint_plugin()
+        print(f"Plugin created: {plugin.name}")
+        print(f"Enabled: {plugin.enabled}")
+        
+        if plugin.enabled:
+            # Test session lifecycle
+            session_id = "test_session_voiceprint_123"
+            plugin.on_recording_started(session_id)
+            plugin.on_speaker_detected("speaker_001", session_id)
+            
+            # Simulate some audio chunks
+            import numpy as np
+            
+            for i in range(5):
+                chunk = AudioChunk(
+                    data=np.random.random(1024).astype(np.float32),
+                    timestamp=time.time(),
+                    sample_rate=16000,
+                    speaker_id="speaker_001",
+                    consent_token="CT-test123",
+                    session_id=session_id,
+                    is_speech=True,
+                    confidence=0.9
+                )
+                
+                plugin.process_audio(chunk)
+                time.sleep(0.5)
+            
+            # Get statistics
+            stats = plugin.get_voiceprint_statistics()
+            print(f"Plugin stats: {stats}")
+            
+            # Test wallet API
+            print(f"\n=== Wallet API Test ===")
+            wallet_api = WalletAPI(plugin)
+            
+            # Simulate voice authentication (would be real audio in practice)
+            test_voice = np.random.random(32000).astype(np.float32)  # 2 seconds
+            auth_result = wallet_api.authenticate_voice(test_voice)
+            print(f"Authentication result: {auth_result}")
+            
+            # Stop session
+            plugin.on_recording_stopped(session_id)
+            
+            # Cleanup
+            plugin.cleanup()
+            
+            print("Plugin test completed successfully")
+        else:
+            print("Plugin disabled - SpeechBrain not available")
+        
+    except Exception as e:
+        print(f"Plugin test failed: {e}")
+    
+    # Test embedding extraction if audio file provided
+    print(f"\n=== Audio File Test ===")
+    audio_file = "test_audio.wav"  # Replace with actual audio file path
+    if os.path.exists(audio_file):
+        extraction_result = test_voiceprint_extraction(audio_file)
+        print(f"Extraction test: {extraction_result}")
+    else:
+        print("No test audio file found - skipping audio extraction test")
+    
+    print(f"\n=== Test Suite Complete ===")
+
+
+# Integration example for complete Eden system
+def create_complete_eden_system():
+    """Example of creating complete Eden system with all plugins"""
+    from src.core.audio_recorder import create_core_audio_recorder, ConfigManager
+    from src.plugins.storage.plugin import create_storage_plugin
+    from src.plugins.consent.manager import create_consent_manager
+    from src.plugins.encryption.plugin import create_encryption_plugin
+    from src.plugins.transcription.plugin import create_transcription_plugin
+    
+    # Create config manager
+    config_manager = ConfigManager()
+    
+    # Create core audio recorder
+    audio_recorder = create_core_audio_recorder(config_manager)
+    
+    # Create plugins in dependency order
+    storage_plugin = create_storage_plugin()
+    consent_manager = create_consent_manager()
+    encryption_plugin = create_encryption_plugin(consent_manager=consent_manager)
+    transcription_plugin = create_transcription_plugin(storage_plugin=storage_plugin)
+    voiceprint_plugin = create_voiceprint_plugin(storage_plugin=storage_plugin)
+    
+    # Register plugins with audio recorder
+    audio_recorder.register_plugin(storage_plugin)
+    audio_recorder.register_plugin(consent_manager)
+    audio_recorder.register_plugin(encryption_plugin)
+    audio_recorder.register_plugin(transcription_plugin)
+    audio_recorder.register_plugin(voiceprint_plugin)
+    
+    # Create wallet API
+    wallet_api = WalletAPI(voiceprint_plugin)
+    
+    return {
+        'audio_recorder': audio_recorder,
+        'storage_plugin': storage_plugin,
+        'consent_manager': consent_manager,
+        'encryption_plugin': encryption_plugin,
+        'transcription_plugin': transcription_plugin,
+        'voiceprint_plugin': voiceprint_plugin,
+        'wallet_api': wallet_api
+    }
+
+
+# Example usage for wallet integration
+class VoiceWalletInterface:
+    """Interface for voice wallet operations"""
+    
+    def __init__(self, wallet_api: WalletAPI):
+        self.wallet_api = wallet_api
+        self.logger = logging.getLogger(__name__)
+    
+    def open_wallet_with_voice(self, voice_audio: np.ndarray, 
+                              background_audio: np.ndarray = None) -> Dict[str, Any]:
+        """
+        Open wallet using voice authentication + background noise analysis
+        voice_audio: Audio of user saying random phrase
+        background_audio: Background audio for keyboard detection
+        """
+        try:
+            # Analyze background audio for keyboard sounds (anti-spoofing)
+            liveness_score = self._analyze_background_liveness(background_audio)
+            
+            if liveness_score < 0.5:
+                return {
+                    'success': False,
+                    'reason': 'failed_liveness_check',
+                    'liveness_score': liveness_score
+                }
+            
+            # Authenticate voice
+            auth_result = self.wallet_api.authenticate_voice(voice_audio)
+            
+            if not auth_result['authenticated']:
+                return {
+                    'success': False,
+                    'reason': auth_result['reason'],
+                    'data': None
+                }
+            
+            # Return wallet data
+            return {
+                'success': True,
+                'user_data': auth_result['data'],
+                'confidence': auth_result['confidence'],
+                'liveness_score': liveness_score
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Wallet opening error: {e}")
+            return {'success': False, 'reason': 'wallet_error', 'error': str(e)}
+    
+    def _analyze_background_liveness(self, background_audio: np.ndarray) -> float:
+        """
+        Analyze background audio for liveness indicators (keyboard sounds, etc.)
+        Returns score 0.0-1.0 indicating liveness confidence
+        """
+        if background_audio is None or len(background_audio) == 0:
+            return 0.3  # No background audio provided
+        
+        try:
+            # Simple liveness analysis - look for varied frequency content
+            # indicating real environment vs. replayed audio
+            
+            # Calculate spectral features
+            fft = np.fft.fft(background_audio)
+            magnitude_spectrum = np.abs(fft)
+            
+            # Look for high-frequency content (keyboard clicks, etc.)
+            high_freq_energy = np.sum(magnitude_spectrum[len(magnitude_spectrum)//4:]) / np.sum(magnitude_spectrum)
+            
+            # Look for temporal variation
+            chunks = np.array_split(background_audio, 10)
+            chunk_energies = [np.sum(chunk**2) for chunk in chunks]
+            energy_variation = np.std(chunk_energies) / (np.mean(chunk_energies) + 1e-8)
+            
+            # Combine factors
+            liveness_score = min(high_freq_energy * 2 + energy_variation * 0.5, 1.0)
+            
+            return float(liveness_score)
+            
+        except Exception as e:
+            self.logger.warning(f"Liveness analysis error: {e}")
+            return 0.5  # Default neutral score
+    
+    def manage_consent(self, speaker_id: str, action: str, token_id: str = None) -> Dict[str, Any]:
+        """Manage consent tokens through wallet interface"""
+        try:
+            if action == "revoke" and token_id:
+                return self.wallet_api.revoke_consent_token(speaker_id, token_id, "wallet_user")
+            elif action == "export":
+                return self.wallet_api.export_user_data(speaker_id)
+            else:
+                return {'success': False, 'error': 'Invalid action or missing token_id'}
+                
+        except Exception as e:
+            self.logger.error(f"Consent management error: {e}")
+            return {'success': False, 'error': str(e)}
+
+
+# Configuration template for voiceprint plugin
+VOICEPRINT_CONFIG_TEMPLATE = """
+# Voiceprint Plugin Configuration
+plugins:
+  voiceprint:
+    enabled: true
+    model_name: "speechbrain/spkrec-ecapa-voxceleb"
+    device: "cuda"  # or "cpu"
+    
+    # Embedding settings
+    embedding_dimension: 192
+    min_audio_duration: 2.0
+    max_audio_duration: 10.0
+    
+    # Consistency settings
+    normalization: true
+    mean_normalization: true
+    voice_activity_threshold: 0.5
+    
+    # Matching settings
+    similarity_threshold: 0.85
+    confidence_threshold: 0.80
+    max_candidates: 5
+    
+    # Storage settings
+    embedding_storage_path: "data/voiceprints"
+    enable_clustering: true
+    cluster_update_interval: 100
+"""
+
