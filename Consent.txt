@@ -1,0 +1,916 @@
+
+Text icon
+Consent.txt
+
+Page
+1
+/
+1
+100%
+﻿"""
+Eden Consent Management System
+Real-time voice consent detection with cryptographic token management.
+
+
+File: src/plugins/consent/manager.py
+"""
+
+
+import asyncio
+import threading
+import queue
+import time
+import logging
+import hashlib
+import json
+import re
+from typing import Dict, List, Optional, Callable, Any, Tuple
+from dataclasses import dataclass, asdict
+from datetime import datetime, timedelta
+from collections import deque
+import numpy as np
+import speech_recognition as sr
+import yaml
+import sqlite3
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+import os
+
+
+
+
+@dataclass
+class ConsentToken:
+    """Cryptographic consent token with complete lineage"""
+    token_id: str
+    speaker_id: str
+    voiceprint_hash: str
+    granted_timestamp: float
+    revoked_timestamp: Optional[float] = None
+    reinstatement_timestamp: Optional[float] = None
+    consent_phrases_detected: List[dict] = None
+    external_revocations: List[dict] = None
+    current_status: str = "active"  # active, revoked, grace_period, deleted
+    grace_expires: Optional[float] = None
+    data_lineage: List[str] = None
+    confidence_scores: List[dict] = None
+    
+    def __post_init__(self):
+        if self.consent_phrases_detected is None:
+            self.consent_phrases_detected = []
+        if self.external_revocations is None:
+            self.external_revocations = []
+        if self.data_lineage is None:
+            self.data_lineage = []
+        if self.confidence_scores is None:
+            self.confidence_scores = []
+    
+    def to_dict(self) -> dict:
+        """Convert to dictionary for storage"""
+        return asdict(self)
+    
+    @classmethod
+    def from_dict(cls, data: dict) -> 'ConsentToken':
+        """Create from dictionary"""
+        return cls(**data)
+
+
+
+
+@dataclass
+class RevocationEvent:
+    """Voice revocation detection event"""
+    timestamp: float
+    speaker_id: str
+    phrase_detected: str
+    confidence: float
+    audio_segment_start: float
+    audio_segment_end: float
+    action_taken: str  # "revoked", "flagged", "ignored"
+    review_required: bool = False
+
+
+
+
+@dataclass
+class ConsentConfig:
+    """Configuration for consent detection"""
+    revocation_confidence_threshold: float = 0.9
+    review_flag_threshold: float = 0.7
+    instant_mute: bool = True
+    grace_period_days: int = 30
+    max_reactivations: int = 5
+    reactivation_cooldown_hours: int = 24
+    revocation_phrases: List[str] = None
+    review_phrases: List[str] = None
+    custom_phrases: List[str] = None
+    
+    def __post_init__(self):
+        if self.revocation_phrases is None:
+            self.revocation_phrases = [
+                "I don't consent",
+                "stop recording me", 
+                "I revoke consent",
+                "delete my voice",
+                "I want out",
+                "remove my data",
+                "stop recording",
+                "I withdraw consent"
+            ]
+        if self.review_phrases is None:
+            self.review_phrases = [
+                "maybe stop",
+                "I'm not sure", 
+                "hold on",
+                "wait a minute",
+                "pause recording",
+                "I need to think"
+            ]
+        if self.custom_phrases is None:
+            self.custom_phrases = []
+
+
+
+
+class ConsentTokenGenerator:
+    """Generate cryptographically secure consent tokens"""
+    
+    def __init__(self, salt: bytes = None):
+        self.salt = salt or b'eden_consent_salt_v1.0'
+        
+    def generate_token(self, speaker_id: str, voiceprint_hash: str, 
+                      timestamp: float = None) -> str:
+        """Generate cryptographic consent token"""
+        if timestamp is None:
+            timestamp = time.time()
+            
+        # Create unique identifier string
+        identifier = f"{speaker_id}:{voiceprint_hash}:{timestamp}"
+        
+        # Generate cryptographic hash
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=self.salt,
+            iterations=100000,
+        )
+        
+        token_bytes = kdf.derive(identifier.encode())
+        token_hash = hashlib.sha256(token_bytes).hexdigest()
+        
+        # Format: CT-{first16chars}-{timestamp}-{last8chars}
+        token_id = f"CT-{token_hash[:16]}-{int(timestamp)}-{token_hash[-8:]}"
+        
+        return token_id
+    
+    def validate_token_format(self, token_id: str) -> bool:
+        """Validate token format"""
+        pattern = r'^CT-[a-f0-9]{16}-\d{10}-[a-f0-9]{8}$'
+        return bool(re.match(pattern, token_id))
+
+
+
+
+class VoiceRevocationDetector:
+    """Real-time voice revocation detection using speech recognition"""
+    
+    def __init__(self, config: ConsentConfig):
+        self.config = config
+        self.recognizer = sr.Recognizer()
+        self.recognizer.energy_threshold = 300
+        self.recognizer.dynamic_energy_threshold = True
+        self.recognizer.pause_threshold = 0.8
+        
+        # Compile phrase patterns for efficiency
+        self.revocation_patterns = [
+            re.compile(phrase.lower().replace(' ', r'\s+'))
+            for phrase in (config.revocation_phrases + config.custom_phrases)
+        ]
+        
+        self.review_patterns = [
+            re.compile(phrase.lower().replace(' ', r'\s+'))
+            for phrase in config.review_phrases
+        ]
+        
+        self.logger = logging.getLogger(__name__)
+    
+    def detect_revocation_in_text(self, text: str) -> Tuple[bool, str, float]:
+        """
+        Detect revocation phrases in transcribed text
+        Returns: (is_revocation, matched_phrase, confidence)
+        """
+        text_lower = text.lower()
+        
+        # Check revocation phrases (90%+ confidence required)
+        for i, pattern in enumerate(self.revocation_patterns):
+            if pattern.search(text_lower):
+                phrase = self.config.revocation_phrases[i] if i < len(self.config.revocation_phrases) else self.config.custom_phrases[i - len(self.config.revocation_phrases)]
+                confidence = 0.95  # High confidence for exact phrase match
+                return True, phrase, confidence
+        
+        # Check review phrases (70-89% confidence)
+        for i, pattern in enumerate(self.review_patterns):
+            if pattern.search(text_lower):
+                phrase = self.config.review_phrases[i]
+                confidence = 0.75  # Medium confidence for review phrases
+                return False, phrase, confidence
+        
+        return False, "", 0.0
+    
+    def process_audio_chunk(self, audio_data: np.ndarray, 
+                          sample_rate: int) -> Optional[RevocationEvent]:
+        """Process audio chunk for revocation detection"""
+        try:
+            # Convert numpy array to audio data for speech recognition
+            audio_bytes = (audio_data * 32767).astype(np.int16).tobytes()
+            
+            # Create AudioData object
+            audio_data_sr = sr.AudioData(audio_bytes, sample_rate, 2)
+            
+            # Recognize speech
+            try:
+                text = self.recognizer.recognize_google(audio_data_sr, language='en-US')
+                self.logger.debug(f"Transcribed: {text}")
+                
+                # Check for revocation phrases
+                is_revocation, phrase, confidence = self.detect_revocation_in_text(text)
+                
+                if confidence >= self.config.review_flag_threshold:
+                    action = "revoked" if confidence >= self.config.revocation_confidence_threshold else "flagged"
+                    review_required = confidence < self.config.revocation_confidence_threshold
+                    
+                    return RevocationEvent(
+                        timestamp=time.time(),
+                        speaker_id="",  # Will be filled by caller
+                        phrase_detected=phrase,
+                        confidence=confidence,
+                        audio_segment_start=time.time() - len(audio_data) / sample_rate,
+                        audio_segment_end=time.time(),
+                        action_taken=action,
+                        review_required=review_required
+                    )
+                    
+            except sr.UnknownValueError:
+                # Could not understand audio
+                pass
+            except sr.RequestError as e:
+                self.logger.warning(f"Speech recognition service error: {e}")
+                
+        except Exception as e:
+            self.logger.error(f"Audio processing error: {e}")
+            
+        return None
+
+
+
+
+class ReviewQueueManager:
+    """Manage flagged consent events requiring human review"""
+    
+    def __init__(self, database_path: str):
+        self.database_path = database_path
+        self.review_queue = queue.Queue()
+        self.callbacks: List[Callable] = []
+        self._init_database()
+        
+    def _init_database(self):
+        """Initialize review queue database"""
+        conn = sqlite3.connect(self.database_path)
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS review_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT UNIQUE,
+                speaker_id TEXT,
+                phrase_detected TEXT,
+                confidence REAL,
+                timestamp REAL,
+                audio_segment_start REAL,
+                audio_segment_end REAL,
+                status TEXT DEFAULT 'pending',
+                reviewed_by TEXT,
+                reviewed_at REAL,
+                decision TEXT,
+                notes TEXT
+            )
+        ''')
+        conn.commit()
+        conn.close()
+    
+    def add_for_review(self, event: RevocationEvent):
+        """Add revocation event to review queue"""
+        event_id = hashlib.sha256(
+            f"{event.speaker_id}:{event.timestamp}:{event.phrase_detected}".encode()
+        ).hexdigest()[:16]
+        
+        conn = sqlite3.connect(self.database_path)
+        conn.execute('''
+            INSERT OR REPLACE INTO review_queue 
+            (event_id, speaker_id, phrase_detected, confidence, timestamp,
+             audio_segment_start, audio_segment_end, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
+        ''', (
+            event_id, event.speaker_id, event.phrase_detected, 
+            event.confidence, event.timestamp, event.audio_segment_start,
+            event.audio_segment_end
+        ))
+        conn.commit()
+        conn.close()
+        
+        # Notify callbacks
+        for callback in self.callbacks:
+            try:
+                callback(event)
+            except Exception as e:
+                logging.error(f"Review queue callback error: {e}")
+    
+    def get_pending_reviews(self) -> List[dict]:
+        """Get all pending review items"""
+        conn = sqlite3.connect(self.database_path)
+        cursor = conn.execute('''
+            SELECT * FROM review_queue WHERE status = 'pending' 
+            ORDER BY timestamp DESC
+        ''')
+        
+        columns = [desc[0] for desc in cursor.description]
+        reviews = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        conn.close()
+        
+        return reviews
+    
+    def resolve_review(self, event_id: str, decision: str, 
+                      reviewed_by: str, notes: str = ""):
+        """Resolve a review item"""
+        conn = sqlite3.connect(self.database_path)
+        conn.execute('''
+            UPDATE review_queue 
+            SET status = 'resolved', decision = ?, reviewed_by = ?, 
+                reviewed_at = ?, notes = ?
+            WHERE event_id = ?
+        ''', (decision, reviewed_by, time.time(), notes, event_id))
+        conn.commit()
+        conn.close()
+
+
+
+
+# Continue with ConsentDatabase class...
+class ConsentDatabase:
+    """Database for consent token storage and management"""
+    
+    def __init__(self, database_path: str):
+        self.database_path = database_path
+        self._init_database()
+    
+    def _init_database(self):
+        """Initialize consent database tables"""
+        conn = sqlite3.connect(self.database_path)
+        
+        # Main tables creation
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS consent_tokens (
+                token_id TEXT PRIMARY KEY,
+                speaker_id TEXT,
+                voiceprint_hash TEXT,
+                granted_timestamp REAL,
+                revoked_timestamp REAL,
+                reinstatement_timestamp REAL,
+                current_status TEXT,
+                grace_expires REAL,
+                consent_data TEXT,
+                created_at REAL DEFAULT (strftime('%s', 'now')),
+                updated_at REAL DEFAULT (strftime('%s', 'now'))
+            )
+        ''')
+        
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS data_lineage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token_id TEXT,
+                file_path TEXT,
+                data_type TEXT,
+                created_at REAL DEFAULT (strftime('%s', 'now')),
+                FOREIGN KEY (token_id) REFERENCES consent_tokens (token_id)
+            )
+        ''')
+        
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS revocation_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token_id TEXT,
+                event_type TEXT,
+                phrase_detected TEXT,
+                confidence REAL,
+                timestamp REAL,
+                action_taken TEXT,
+                metadata TEXT,
+                FOREIGN KEY (token_id) REFERENCES consent_tokens (token_id)
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+    
+    def store_token(self, token: ConsentToken):
+        """Store or update consent token"""
+        conn = sqlite3.connect(self.database_path)
+        
+        consent_data = json.dumps(token.to_dict())
+        
+        conn.execute('''
+            INSERT OR REPLACE INTO consent_tokens 
+            (token_id, speaker_id, voiceprint_hash, granted_timestamp,
+             revoked_timestamp, reinstatement_timestamp, current_status,
+             grace_expires, consent_data, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            token.token_id, token.speaker_id, token.voiceprint_hash,
+            token.granted_timestamp, token.revoked_timestamp,
+            token.reinstatement_timestamp, token.current_status,
+            token.grace_expires, consent_data, time.time()
+        ))
+        
+        conn.commit()
+        conn.close()
+    
+    def get_token(self, token_id: str) -> Optional[ConsentToken]:
+        """Retrieve consent token by ID"""
+        conn = sqlite3.connect(self.database_path)
+        cursor = conn.execute(
+            'SELECT consent_data FROM consent_tokens WHERE token_id = ?',
+            (token_id,)
+        )
+        
+        row = cursor.fetchone()
+        conn.close()
+        
+        if row:
+            token_data = json.loads(row[0])
+            return ConsentToken.from_dict(token_data)
+        
+        return None
+    
+    def get_tokens_by_speaker(self, speaker_id: str) -> List[ConsentToken]:
+        """Get all tokens for a speaker"""
+        conn = sqlite3.connect(self.database_path)
+        cursor = conn.execute(
+            'SELECT consent_data FROM consent_tokens WHERE speaker_id = ?',
+            (speaker_id,)
+        )
+        
+        tokens = []
+        for row in cursor.fetchall():
+            token_data = json.loads(row[0])
+            tokens.append(ConsentToken.from_dict(token_data))
+        
+        conn.close()
+        return tokens
+    
+    def add_data_lineage(self, token_id: str, file_path: str, data_type: str):
+        """Add data lineage entry"""
+        conn = sqlite3.connect(self.database_path)
+        conn.execute('''
+            INSERT INTO data_lineage (token_id, file_path, data_type)
+            VALUES (?, ?, ?)
+        ''', (token_id, file_path, data_type))
+        conn.commit()
+        conn.close()
+    
+    def get_data_lineage(self, token_id: str) -> List[dict]:
+        """Get all data lineage for a token"""
+        conn = sqlite3.connect(self.database_path)
+        cursor = conn.execute('''
+            SELECT file_path, data_type, created_at 
+            FROM data_lineage WHERE token_id = ?
+            ORDER BY created_at DESC
+        ''', (token_id,))
+        
+        lineage = []
+        for row in cursor.fetchall():
+            lineage.append({
+                'file_path': row[0],
+                'data_type': row[1],
+                'created_at': row[2]
+            })
+        
+        conn.close()
+        return lineage
+    
+    def record_revocation_event(self, token_id: str, event: RevocationEvent):
+        """Record a revocation event"""
+        conn = sqlite3.connect(self.database_path)
+        
+        metadata = json.dumps({
+            'audio_segment_start': event.audio_segment_start,
+            'audio_segment_end': event.audio_segment_end,
+            'review_required': event.review_required
+        })
+        
+        conn.execute('''
+            INSERT INTO revocation_events 
+            (token_id, event_type, phrase_detected, confidence, 
+             timestamp, action_taken, metadata)
+            VALUES (?, 'voice_detected', ?, ?, ?, ?, ?)
+        ''', (
+            token_id, event.phrase_detected, event.confidence,
+            event.timestamp, event.action_taken, metadata
+        ))
+        
+        conn.commit()
+        conn.close()
+
+
+
+
+# Factory functions
+def load_consent_config(config_path: str = "config/plugins_config.yaml") -> ConsentConfig:
+    """Load consent configuration from YAML file"""
+    with open(config_path, 'r') as f:
+        config_dict = yaml.safe_load(f)
+    
+    # Look for consent config in plugins section
+    plugins_dict = config_dict.get('plugins', {})
+    consent_dict = plugins_dict.get('consent_monitoring', {})
+    return ConsentConfig(**consent_dict)
+
+
+
+
+def create_consent_manager(config_path: str = "config/plugins_config.yaml", 
+                          database_path: str = "data/consent.db") -> 'ConsentManager':
+    """Create consent manager with configuration"""
+    config = load_consent_config(config_path)
+    return ConsentManager(config, database_path)
+class ConsentManager:
+    """Main consent management system"""
+    
+    def __init__(self, config: ConsentConfig, database_path: str):
+        self.config = config
+        self.database = ConsentDatabase(database_path)
+        self.token_generator = ConsentTokenGenerator()
+        self.voice_detector = VoiceRevocationDetector(config)
+        self.review_queue = ReviewQueueManager(database_path.replace('.db', '_reviews.db'))
+        
+        # Active tokens cache
+        self.active_tokens: Dict[str, ConsentToken] = {}
+        
+        # Real-time processing
+        self.audio_queue = queue.Queue()
+        self.processing_thread = None
+        self.running = threading.Event()
+        
+        # Callbacks
+        self.callbacks: Dict[str, List[Callable]] = {
+            'consent_granted': [],
+            'consent_revoked': [],
+            'consent_reinstated': [],
+            'mute_speaker': [],
+            'review_required': [],
+            'grace_period_expired': []
+        }
+        
+        self.logger = logging.getLogger(__name__)
+        
+        # Start background processes
+        self._start_background_processes()
+    
+    def request_initial_consent(self, speaker_id: str, 
+                              voiceprint_hash: str) -> ConsentToken:
+        """Request initial consent from user (UI popup integration point)"""
+        # Generate token
+        token_id = self.token_generator.generate_token(speaker_id, voiceprint_hash)
+        
+        # Create consent token
+        token = ConsentToken(
+            token_id=token_id,
+            speaker_id=speaker_id,
+            voiceprint_hash=voiceprint_hash,
+            granted_timestamp=time.time(),
+            current_status="active"
+        )
+        
+        # Store in database and cache
+        self.database.store_token(token)
+        self.active_tokens[token_id] = token
+        
+        # Trigger callback
+        self._trigger_callback('consent_granted', token)
+        
+        self.logger.info(f"Initial consent granted for speaker {speaker_id}, token: {token_id}")
+        return token
+    
+    def process_audio_chunk(self, audio_data: np.ndarray, sample_rate: int, 
+                          speaker_id: str, token_id: str):
+        """Process audio chunk for real-time consent detection"""
+        if not self.is_consent_active(token_id):
+            return  # Don't process if consent already revoked
+        
+        # Queue for background processing
+        self.audio_queue.put({
+            'audio_data': audio_data,
+            'sample_rate': sample_rate,
+            'speaker_id': speaker_id,
+            'token_id': token_id,
+            'timestamp': time.time()
+        })
+    
+    def _process_audio_background(self):
+        """Background thread for processing audio chunks"""
+        while self.running.is_set():
+            try:
+                # Get audio chunk with timeout
+                try:
+                    chunk_data = self.audio_queue.get(timeout=1.0)
+                except queue.Empty:
+                    continue
+                
+                # Detect revocation
+                event = self.voice_detector.process_audio_chunk(
+                    chunk_data['audio_data'],
+                    chunk_data['sample_rate']
+                )
+                
+                if event:
+                    event.speaker_id = chunk_data['speaker_id']
+                    
+                    # Handle based on confidence
+                    if event.confidence >= self.config.revocation_confidence_threshold:
+                        # Instant revocation
+                        self._handle_voice_revocation(chunk_data['token_id'], event)
+                    elif event.confidence >= self.config.review_flag_threshold:
+                        # Flag for review
+                        self._handle_review_flag(chunk_data['token_id'], event)
+                
+                self.audio_queue.task_done()
+                
+            except Exception as e:
+                self.logger.error(f"Background audio processing error: {e}")
+                time.sleep(0.1)
+    
+    def _handle_voice_revocation(self, token_id: str, event: RevocationEvent):
+        """Handle instant voice revocation"""
+        token = self.active_tokens.get(token_id)
+        if not token:
+            return
+        
+        # Update token status
+        token.revoked_timestamp = event.timestamp
+        token.current_status = "revoked"
+        token.grace_expires = time.time() + (self.config.grace_period_days * 24 * 3600)
+        token.consent_phrases_detected.append({
+            'phrase': event.phrase_detected,
+            'confidence': event.confidence,
+            'timestamp': event.timestamp,
+            'action': 'revoked'
+        })
+        
+        # Store changes
+        self.database.store_token(token)
+        self.database.record_revocation_event(token_id, event)
+        
+        # Trigger callbacks
+        self._trigger_callback('consent_revoked', token)
+        self._trigger_callback('mute_speaker', {
+            'speaker_id': event.speaker_id,
+            'token_id': token_id,
+            'timestamp': event.timestamp
+        })
+        
+        self.logger.warning(f"Voice revocation detected for token {token_id}: '{event.phrase_detected}' ({event.confidence:.2f})")
+    
+    def _handle_review_flag(self, token_id: str, event: RevocationEvent):
+        """Handle medium-confidence detection requiring review"""
+        token = self.active_tokens.get(token_id)
+        if not token:
+            return
+        
+        # Add to review queue
+        self.review_queue.add_for_review(event)
+        
+        # Record event
+        self.database.record_revocation_event(token_id, event)
+        
+        # Update token with flagged event
+        token.confidence_scores.append({
+            'phrase': event.phrase_detected,
+            'confidence': event.confidence,
+            'timestamp': event.timestamp,
+            'status': 'flagged_for_review'
+        })
+        
+        self.database.store_token(token)
+        
+        # Trigger callback
+        self._trigger_callback('review_required', {
+            'token_id': token_id,
+            'event': event
+        })
+        
+        self.logger.info(f"Consent event flagged for review: {token_id} - '{event.phrase_detected}' ({event.confidence:.2f})")
+    
+    def external_revocation(self, token_id: str, revoked_by: str = "external"):
+        """Handle external consent revocation (from wallet/UI)"""
+        token = self.active_tokens.get(token_id)
+        if not token:
+            token = self.database.get_token(token_id)
+            if not token:
+                return False
+        
+        # Update token
+        token.revoked_timestamp = time.time()
+        token.current_status = "revoked"
+        token.grace_expires = time.time() + (self.config.grace_period_days * 24 * 3600)
+        token.external_revocations.append({
+            'timestamp': time.time(),
+            'revoked_by': revoked_by,
+            'reason': 'external_request'
+        })
+        
+        # Store changes
+        self.database.store_token(token)
+        self.active_tokens[token_id] = token
+        
+        # Trigger callbacks
+        self._trigger_callback('consent_revoked', token)
+        
+        self.logger.info(f"External revocation for token {token_id} by {revoked_by}")
+        return True
+    
+    def reinstate_consent(self, token_id: str, reinstated_by: str = "user"):
+        """Reinstate revoked consent"""
+        token = self.active_tokens.get(token_id)
+        if not token:
+            token = self.database.get_token(token_id)
+            if not token:
+                return False
+        
+        if token.current_status != "revoked":
+            return False
+        
+        # Check reactivation limits
+        reactivation_count = len([r for r in token.external_revocations if 'reinstatement' in r.get('reason', '')])
+        if reactivation_count >= self.config.max_reactivations:
+            self.logger.warning(f"Reactivation limit exceeded for token {token_id}")
+            return False
+        
+        # Update token
+        token.reinstatement_timestamp = time.time()
+        token.current_status = "active"
+        token.grace_expires = None
+        token.external_revocations.append({
+            'timestamp': time.time(),
+            'revoked_by': reinstated_by,
+            'reason': 'reinstatement'
+        })
+        
+        # Store changes
+        self.database.store_token(token)
+        self.active_tokens[token_id] = token
+        
+        # Trigger callback
+        self._trigger_callback('consent_reinstated', token)
+        
+        self.logger.info(f"Consent reinstated for token {token_id} by {reinstated_by}")
+        return True
+    
+    def is_consent_active(self, token_id: str) -> bool:
+        """Check if consent is currently active"""
+        token = self.active_tokens.get(token_id)
+        if not token:
+            token = self.database.get_token(token_id)
+            if not token:
+                return False
+            self.active_tokens[token_id] = token
+        
+        return token.current_status == "active"
+    
+    def get_token_status(self, token_id: str) -> Optional[dict]:
+        """Get detailed token status"""
+        token = self.active_tokens.get(token_id)
+        if not token:
+            token = self.database.get_token(token_id)
+            if not token:
+                return None
+        
+        return {
+            'token_id': token.token_id,
+            'speaker_id': token.speaker_id,
+            'status': token.current_status,
+            'granted_at': datetime.fromtimestamp(token.granted_timestamp).isoformat(),
+            'revoked_at': datetime.fromtimestamp(token.revoked_timestamp).isoformat() if token.revoked_timestamp else None,
+            'grace_expires': datetime.fromtimestamp(token.grace_expires).isoformat() if token.grace_expires else None,
+            'data_lineage_count': len(self.database.get_data_lineage(token_id)),
+            'voice_revocations': len(token.consent_phrases_detected),
+            'external_revocations': len(token.external_revocations)
+        }
+    
+    def add_data_lineage(self, token_id: str, file_path: str, data_type: str):
+        """Add data lineage tracking"""
+        self.database.add_data_lineage(token_id, file_path, data_type)
+        
+        # Update token cache
+        if token_id in self.active_tokens:
+            self.active_tokens[token_id].data_lineage.append(file_path)
+    
+    def _start_background_processes(self):
+        """Start background processing threads"""
+        self.running.set()
+        
+        # Audio processing thread
+        self.processing_thread = threading.Thread(
+            target=self._process_audio_background,
+            daemon=True,
+            name="ConsentAudioProcessor"
+        )
+        self.processing_thread.start()
+        
+        # Grace period monitor (could be added as another thread)
+        
+    def add_callback(self, event_type: str, callback: Callable):
+        """Add event callback"""
+        if event_type in self.callbacks:
+            self.callbacks[event_type].append(callback)
+    
+    def _trigger_callback(self, event_type: str, data: Any):
+        """Trigger callbacks for an event"""
+        for callback in self.callbacks.get(event_type, []):
+            try:
+                callback(data)
+            except Exception as e:
+                self.logger.error(f"Callback error for {event_type}: {e}")
+    
+    def cleanup(self):
+        """Clean up resources"""
+        self.running.clear()
+        if self.processing_thread and self.processing_thread.is_alive():
+            self.processing_thread.join(timeout=2.0)
+
+
+
+
+if __name__ == "__main__":
+    # Example usage and testing
+    logging.basicConfig(level=logging.INFO)
+    
+    # Create consent manager
+    consent_manager = create_consent_manager()
+    
+    # Set up callbacks
+    def on_consent_granted(token):
+        print(f"✅ Consent granted: {token.token_id} for speaker {token.speaker_id}")
+    
+    def on_consent_revoked(token):
+        print(f"❌ Consent revoked: {token.token_id} for speaker {token.speaker_id}")
+    
+    def on_mute_speaker(data):
+        print(f"🔇 Muting speaker {data['speaker_id']} at {data['timestamp']}")
+    
+    def on_review_required(data):
+        print(f"⚠️ Review required for token {data['token_id']}: {data['event'].phrase_detected}")
+    
+    consent_manager.add_callback('consent_granted', on_consent_granted)
+    consent_manager.add_callback('consent_revoked', on_consent_revoked)
+    consent_manager.add_callback('mute_speaker', on_mute_speaker)
+    consent_manager.add_callback('review_required', on_review_required)
+    
+    # Example: Request initial consent
+    print("Requesting initial consent...")
+    token = consent_manager.request_initial_consent("speaker_001", "voiceprint_hash_abc123")
+    
+    # Example: Check consent status
+    status = consent_manager.get_token_status(token.token_id)
+    print(f"Token status: {status}")
+    
+    # Example: Add data lineage
+    consent_manager.add_data_lineage(token.token_id, "session_001/speaker_001_clean.wav", "audio")
+    consent_manager.add_data_lineage(token.token_id, "session_001/speaker_001_encrypted.enc", "encrypted_audio")
+    
+    # Example: Simulate voice revocation
+    print("\nSimulating voice revocation detection...")
+    fake_audio = np.random.random(16000).astype(np.float32)  # 1 second of fake audio
+    consent_manager.process_audio_chunk(fake_audio, 16000, "speaker_001", token.token_id)
+    
+    # Wait a moment for background processing
+    time.sleep(0.5)
+    
+    # Example: External revocation
+    print("\nSimulating external revocation...")
+    success = consent_manager.external_revocation(token.token_id, "wallet_app")
+    print(f"External revocation successful: {success}")
+    
+    # Example: Reinstate consent
+    print("\nSimulating consent reinstatement...")
+    success = consent_manager.reinstate_consent(token.token_id, "user_ui")
+    print(f"Reinstatement successful: {success}")
+    
+    # Example: Get pending reviews
+    pending_reviews = consent_manager.review_queue.get_pending_reviews()
+    print(f"\nPending reviews: {len(pending_reviews)}")
+    
+    # Final status check
+    final_status = consent_manager.get_token_status(token.token_id)
+    print(f"\nFinal token status: {final_status}")
+    
+    # Cleanup
+    consent_manager.cleanup()
+    print("\nConsent manager cleaned up")
+Displaying Consent.txt.
