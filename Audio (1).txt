@@ -1,0 +1,1310 @@
+"""
+Eden Core Audio Recorder with Plugin Architecture
+High-performance audio capture with real-time plugin distribution.
+
+File: src/core/audio_recorder.py
+"""
+
+import asyncio
+import threading
+import queue
+import time
+import logging
+import numpy as np
+from typing import Dict, List, Optional, Callable, Any, Protocol
+from dataclasses import dataclass, field
+from collections import deque
+import pyaudio
+import torch
+import torchaudio
+from pyannote.audio import Pipeline
+from pyannote.audio.pipelines.speaker_verification import PretrainedSpeakerEmbedding
+import webrtcvad
+import scipy.signal
+import yaml
+import json
+from abc import ABC, abstractmethod
+
+
+@dataclass
+class AudioConfig:
+    """Core audio configuration"""
+    sample_rate: int = 16000
+    channels: int = 1
+    chunk_size: int = 1024
+    format: int = pyaudio.paInt16
+    device_index: Optional[int] = None
+    buffer_duration: float = 2.0
+    vad_aggressiveness: int = 2
+    speaker_confidence_threshold: float = 0.9
+    noise_reduction: bool = True
+    auto_gain_control: bool = True
+
+
+@dataclass 
+class PluginConfig:
+    """Plugin distribution configuration"""
+    chunk_size_ms: int = 250  # Real-time chunk timing
+    max_plugin_latency: float = 0.05  # 50ms timeout
+    parallel_processing: bool = True
+    queue_max_size: int = 100
+    performance_monitoring: bool = True
+
+
+@dataclass
+class AudioChunk:
+    """Enhanced audio chunk with plugin metadata"""
+    data: np.ndarray
+    timestamp: float
+    sample_rate: int
+    speaker_id: Optional[str] = None
+    confidence: float = 0.0
+    is_speech: bool = False
+    consent_token: Optional[str] = None
+    consent_status: str = "active"
+    session_id: str = ""
+    chunk_sequence: int = 0
+    voice_activity_score: float = 0.0
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+class PluginInterface(Protocol):
+    """Protocol that all audio plugins must implement"""
+    
+    @property
+    def name(self) -> str:
+        """Plugin name"""
+        ...
+    
+    @property
+    def enabled(self) -> bool:
+        """Whether plugin is enabled"""
+        ...
+    
+    def process_audio(self, chunk: AudioChunk) -> Optional[AudioChunk]:
+        """Process audio chunk, return modified chunk or None"""
+        ...
+    
+    def on_recording_started(self, session_id: str) -> None:
+        """Called when recording session starts"""
+        ...
+    
+    def on_recording_stopped(self, session_id: str) -> None:
+        """Called when recording session stops"""
+        ...
+    
+    def on_speaker_detected(self, speaker_id: str, session_id: str) -> None:
+        """Called when new speaker is detected"""
+        ...
+    
+    def cleanup(self) -> None:
+        """Cleanup plugin resources"""
+        ...
+
+
+class CircularBuffer:
+    """Thread-safe circular buffer for audio data"""
+    
+    def __init__(self, max_size: int):
+        self.max_size = max_size
+        self.buffer = deque(maxlen=max_size)
+        self.lock = threading.Lock()
+        self.sequence_counter = 0
+    
+    def append(self, item: AudioChunk):
+        with self.lock:
+            item.chunk_sequence = self.sequence_counter
+            self.sequence_counter += 1
+            self.buffer.append(item)
+    
+    def get_recent(self, n: int) -> List[AudioChunk]:
+        with self.lock:
+            return list(self.buffer)[-n:]
+    
+    def clear(self):
+        with self.lock:
+            self.buffer.clear()
+            self.sequence_counter = 0
+
+
+class VoiceActivityDetector:
+    """Real-time voice activity detection using WebRTC VAD"""
+    
+    def __init__(self, sample_rate: int = 16000, aggressiveness: int = 2):
+        self.sample_rate = sample_rate
+        self.vad = webrtcvad.Vad(aggressiveness)
+        self.frame_duration = 30  # ms
+        self.frame_size = int(sample_rate * self.frame_duration / 1000)
+        
+    def is_speech(self, audio_data: np.ndarray) -> tuple[bool, float]:
+        """
+        Detect if audio contains speech
+        Returns: (is_speech, confidence_score)
+        """
+        try:
+            # Convert to bytes if needed
+            if audio_data.dtype != np.int16:
+                audio_data = (audio_data * 32767).astype(np.int16)
+            
+            # Process in frames
+            frames = self._split_into_frames(audio_data)
+            speech_frames = 0
+            
+            for frame in frames:
+                if len(frame) == self.frame_size:
+                    if self.vad.is_speech(frame.tobytes(), self.sample_rate):
+                        speech_frames += 1
+            
+            if not frames:
+                return False, 0.0
+            
+            confidence = speech_frames / len(frames)
+            is_speech = confidence > 0.3
+            
+            return is_speech, confidence
+            
+        except Exception as e:
+            logging.warning(f"VAD error: {e}")
+            return False, 0.0
+    
+    def _split_into_frames(self, audio_data: np.ndarray) -> List[np.ndarray]:
+        """Split audio into VAD-compatible frames"""
+        frames = []
+        for i in range(0, len(audio_data), self.frame_size):
+            frame = audio_data[i:i + self.frame_size]
+            if len(frame) == self.frame_size:
+                frames.append(frame)
+        return frames
+
+
+class AudioPreprocessor:
+    """Audio preprocessing for optimal speech recognition"""
+    
+    def __init__(self, sample_rate: int = 16000):
+        self.sample_rate = sample_rate
+        
+        # High-pass filter to remove low-frequency noise
+        self.highpass_cutoff = 80  # Hz
+        self.lowpass_cutoff = 8000  # Hz
+        
+        # Design filters
+        nyquist = sample_rate / 2
+        self.highpass_b, self.highpass_a = scipy.signal.butter(
+            2, self.highpass_cutoff / nyquist, btype='high'
+        )
+        self.lowpass_b, self.lowpass_a = scipy.signal.butter(
+            2, self.lowpass_cutoff / nyquist, btype='low'
+        )
+    
+    def process(self, audio_data: np.ndarray, 
+                noise_reduction: bool = True,
+                auto_gain: bool = True) -> np.ndarray:
+        """Apply preprocessing to audio data"""
+        if len(audio_data) == 0:
+            return audio_data
+            
+        processed = audio_data.copy()
+        
+        # Apply bandpass filtering
+        try:
+            processed = scipy.signal.filtfilt(self.highpass_b, self.highpass_a, processed)
+            processed = scipy.signal.filtfilt(self.lowpass_b, self.lowpass_a, processed)
+        except Exception as e:
+            logging.warning(f"Filter error: {e}")
+            return audio_data
+        
+        if noise_reduction:
+            processed = self._reduce_noise(processed)
+        
+        if auto_gain:
+            processed = self._auto_gain_control(processed)
+        
+        return processed
+    
+    def _reduce_noise(self, audio_data: np.ndarray) -> np.ndarray:
+        """Simple noise reduction using spectral subtraction"""
+        # Placeholder - implement proper spectral subtraction in production
+        return audio_data
+    
+    def _auto_gain_control(self, audio_data: np.ndarray) -> np.ndarray:
+        """Automatic gain control to normalize audio levels"""
+        if len(audio_data) == 0:
+            return audio_data
+            
+        # Calculate RMS
+        rms = np.sqrt(np.mean(audio_data ** 2))
+        
+        if rms > 0:
+            target_rms = 0.1  # Target RMS level
+            gain = target_rms / rms
+            
+            # Limit gain to prevent excessive amplification
+            gain = np.clip(gain, 0.1, 10.0)
+            return audio_data * gain
+        
+        return audio_data
+
+
+class SpeakerDiarization:
+    """Real-time speaker diarization and separation"""
+    
+    def __init__(self, confidence_threshold: float = 0.9, device: str = "cuda"):
+        self.confidence_threshold = confidence_threshold
+        self.device = device
+        self.speakers: Dict[str, dict] = {}
+        self.speaker_counter = 0
+        
+        # Initialize speaker embedding model
+        try:
+            self.embedding_model = PretrainedSpeakerEmbedding(
+                "speechbrain/spkrec-ecapa-voxceleb",
+                device=torch.device(device if torch.cuda.is_available() else "cpu")
+            )
+        except Exception as e:
+            logging.warning(f"Could not load speaker embedding model: {e}")
+            self.embedding_model = None
+        
+        self.logger = logging.getLogger(__name__)
+    
+    def process_audio_chunk(self, audio_data: np.ndarray, 
+                          timestamp: float, 
+                          sample_rate: int) -> tuple[str, float]:
+        """
+        Process audio chunk and return speaker ID and confidence
+        Returns: (speaker_id, confidence)
+        """
+        if self.embedding_model is None:
+            return "unknown", 1.0
+        
+        try:
+            # Convert to tensor
+            audio_tensor = torch.from_numpy(audio_data).float().unsqueeze(0)
+            
+            # Get speaker embedding
+            with torch.no_grad():
+                embedding = self.embedding_model(audio_tensor)
+                embedding = embedding.cpu().numpy().flatten()
+            
+            # Find matching speaker or create new one
+            speaker_id, confidence = self._match_or_create_speaker(
+                embedding, timestamp
+            )
+            
+            return speaker_id, confidence
+            
+        except Exception as e:
+            self.logger.error(f"Speaker diarization error: {e}")
+            return "error", 0.0
+    
+    def _match_or_create_speaker(self, embedding: np.ndarray, 
+                               timestamp: float) -> tuple[str, float]:
+        """Match embedding to existing speaker or create new one"""
+        best_match_id = None
+        best_similarity = 0.0
+        
+        # Compare with existing speakers
+        for speaker_id, speaker_info in self.speakers.items():
+            similarity = self._cosine_similarity(embedding, speaker_info['embedding'])
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_match_id = speaker_id
+        
+        # Check if match is confident enough
+        if best_similarity >= self.confidence_threshold:
+            # Update existing speaker
+            self.speakers[best_match_id]['last_seen'] = timestamp
+            self.speakers[best_match_id]['total_speech_time'] += 0.1
+            return best_match_id, best_similarity
+        else:
+            # Create new speaker
+            new_speaker_id = f"speaker_{self.speaker_counter:03d}"
+            self.speaker_counter += 1
+            
+            self.speakers[new_speaker_id] = {
+                'embedding': embedding.copy(),
+                'confidence': 1.0,
+                'first_seen': timestamp,
+                'last_seen': timestamp,
+                'total_speech_time': 0.1
+            }
+            
+            return new_speaker_id, 1.0
+    
+    def _cosine_similarity(self, a: np.ndarray, b: np.ndarray) -> float:
+        """Calculate cosine similarity between two embeddings"""
+        norm_a = np.linalg.norm(a)
+        norm_b = np.linalg.norm(b)
+        
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+        
+        return np.dot(a, b) / (norm_a * norm_b)
+
+
+class PluginManager:
+    """Manages plugin registration and audio distribution"""
+    
+    def __init__(self, config: PluginConfig):
+        self.config = config
+        self.plugins: Dict[str, PluginInterface] = {}
+        self.plugin_queues: Dict[str, queue.Queue] = {}
+        self.plugin_threads: Dict[str, threading.Thread] = {}
+        self.plugin_performance: Dict[str, dict] = {}
+        
+        self.running = threading.Event()
+        self.logger = logging.getLogger(__name__)
+    
+    def register_plugin(self, plugin: PluginInterface):
+        """Register a plugin for audio processing"""
+        plugin_name = plugin.name
+        
+        if plugin_name in self.plugins:
+            self.logger.warning(f"Plugin {plugin_name} already registered, replacing")
+        
+        self.plugins[plugin_name] = plugin
+        
+        if plugin.enabled:
+            self._start_plugin_thread(plugin_name)
+        
+        self.logger.info(f"Plugin registered: {plugin_name} (enabled: {plugin.enabled})")
+    
+    def unregister_plugin(self, plugin_name: str):
+        """Unregister a plugin"""
+        if plugin_name in self.plugins:
+            self._stop_plugin_thread(plugin_name)
+            plugin = self.plugins.pop(plugin_name)
+            plugin.cleanup()
+            self.logger.info(f"Plugin unregistered: {plugin_name}")
+    
+    def enable_plugin(self, plugin_name: str):
+        """Enable a plugin"""
+        if plugin_name in self.plugins:
+            plugin = self.plugins[plugin_name]
+            if hasattr(plugin, '_enabled'):
+                plugin._enabled = True
+            self._start_plugin_thread(plugin_name)
+    
+    def disable_plugin(self, plugin_name: str):
+        """Disable a plugin"""
+        if plugin_name in self.plugins:
+            plugin = self.plugins[plugin_name]
+            if hasattr(plugin, '_enabled'):
+                plugin._enabled = False
+            self._stop_plugin_thread(plugin_name)
+    
+    def distribute_audio(self, chunk: AudioChunk):
+        """Distribute audio chunk to all enabled plugins"""
+        for plugin_name, plugin in self.plugins.items():
+            if plugin.enabled and plugin_name in self.plugin_queues:
+                try:
+                    # Non-blocking put with timeout
+                    self.plugin_queues[plugin_name].put(chunk, block=False)
+                except queue.Full:
+                    self.logger.warning(f"Plugin {plugin_name} queue full, dropping chunk")
+    
+    def _start_plugin_thread(self, plugin_name: str):
+        """Start processing thread for a plugin"""
+        if plugin_name in self.plugin_threads:
+            return  # Already running
+        
+        # Create queue
+        self.plugin_queues[plugin_name] = queue.Queue(self.config.queue_max_size)
+        
+        # Initialize performance tracking
+        self.plugin_performance[plugin_name] = {
+            'chunks_processed': 0,
+            'total_latency': 0.0,
+            'max_latency': 0.0,
+            'errors': 0
+        }
+        
+        # Start thread
+        thread = threading.Thread(
+            target=self._plugin_worker,
+            args=(plugin_name,),
+            daemon=True,
+            name=f"Plugin-{plugin_name}"
+        )
+        
+        self.plugin_threads[plugin_name] = thread
+        thread.start()
+        
+        self.logger.info(f"Started plugin thread: {plugin_name}")
+    
+    def _stop_plugin_thread(self, plugin_name: str):
+        """Stop processing thread for a plugin"""
+        if plugin_name in self.plugin_queues:
+            # Signal shutdown by putting None
+            try:
+                self.plugin_queues[plugin_name].put(None, block=False)
+            except queue.Full:
+                pass
+        
+        if plugin_name in self.plugin_threads:
+            thread = self.plugin_threads.pop(plugin_name)
+            thread.join(timeout=2.0)
+        
+        if plugin_name in self.plugin_queues:
+            del self.plugin_queues[plugin_name]
+        
+        self.logger.info(f"Stopped plugin thread: {plugin_name}")
+    
+    def _plugin_worker(self, plugin_name: str):
+        """Worker thread for processing plugin audio"""
+        plugin = self.plugins[plugin_name]
+        plugin_queue = self.plugin_queues[plugin_name]
+        performance = self.plugin_performance[plugin_name]
+        
+        while self.running.is_set():
+            try:
+                # Get chunk with timeout
+                chunk = plugin_queue.get(timeout=1.0)
+                
+                if chunk is None:  # Shutdown signal
+                    break
+                
+                # Process with timing
+                start_time = time.time()
+                
+                try:
+                    plugin.process_audio(chunk)
+                    
+                    # Update performance metrics
+                    latency = time.time() - start_time
+                    performance['chunks_processed'] += 1
+                    performance['total_latency'] += latency
+                    performance['max_latency'] = max(performance['max_latency'], latency)
+                    
+                    # Check for performance issues
+                    if latency > self.config.max_plugin_latency:
+                        self.logger.warning(
+                            f"Plugin {plugin_name} slow: {latency*1000:.1f}ms "
+                            f"(limit: {self.config.max_plugin_latency*1000:.1f}ms)"
+                        )
+                
+                except Exception as e:
+                    performance['errors'] += 1
+                    self.logger.error(f"Plugin {plugin_name} processing error: {e}")
+                
+                plugin_queue.task_done()
+                
+            except queue.Empty:
+                continue
+            except Exception as e:
+                self.logger.error(f"Plugin {plugin_name} worker error: {e}")
+                time.sleep(0.1)
+    
+    def get_performance_stats(self) -> Dict[str, dict]:
+        """Get performance statistics for all plugins"""
+        stats = {}
+        
+        for plugin_name, perf in self.plugin_performance.items():
+            if perf['chunks_processed'] > 0:
+                avg_latency = perf['total_latency'] / perf['chunks_processed']
+                stats[plugin_name] = {
+                    'chunks_processed': perf['chunks_processed'],
+                    'average_latency_ms': avg_latency * 1000,
+                    'max_latency_ms': perf['max_latency'] * 1000,
+                    'errors': perf['errors'],
+                    'queue_size': self.plugin_queues.get(plugin_name, queue.Queue()).qsize()
+                }
+            else:
+                stats[plugin_name] = {
+                    'chunks_processed': 0,
+                    'average_latency_ms': 0,
+                    'max_latency_ms': 0,
+                    'errors': 0,
+                    'queue_size': 0
+                }
+        
+        return stats
+    
+    def notify_recording_started(self, session_id: str):
+        """Notify all plugins that recording started"""
+        for plugin in self.plugins.values():
+            if plugin.enabled:
+                try:
+                    plugin.on_recording_started(session_id)
+                except Exception as e:
+                    self.logger.error(f"Plugin {plugin.name} recording_started error: {e}")
+    
+    def notify_recording_stopped(self, session_id: str):
+        """Notify all plugins that recording stopped"""
+        for plugin in self.plugins.values():
+            if plugin.enabled:
+                try:
+                    plugin.on_recording_stopped(session_id)
+                except Exception as e:
+                    self.logger.error(f"Plugin {plugin.name} recording_stopped error: {e}")
+    
+    def notify_speaker_detected(self, speaker_id: str, session_id: str):
+        """Notify all plugins of new speaker detection"""
+        for plugin in self.plugins.values():
+            if plugin.enabled:
+                try:
+                    plugin.on_speaker_detected(speaker_id, session_id)
+                except Exception as e:
+                    self.logger.error(f"Plugin {plugin.name} speaker_detected error: {e}")
+    
+    def cleanup(self):
+        """Clean up all plugins and threads"""
+        self.running.clear()
+        
+        # Stop all plugin threads
+        for plugin_name in list(self.plugin_threads.keys()):
+            self._stop_plugin_thread(plugin_name)
+        
+        # Cleanup all plugins
+        for plugin in self.plugins.values():
+            try:
+                plugin.cleanup()
+            except Exception as e:
+                self.logger.error(f"Plugin cleanup error: {e}")
+
+
+class CoreAudioRecorder:
+    """Main audio recording system with plugin architecture"""
+    
+    def __init__(self, audio_config: AudioConfig, plugin_config: PluginConfig):
+        self.audio_config = audio_config
+        self.plugin_config = plugin_config
+        
+        # Audio system
+        self.pyaudio = pyaudio.PyAudio()
+        self.stream = None
+        self.is_recording = False
+        self.is_paused = False
+        
+        # Session management
+        self.session_id = self._generate_session_id()
+        self.start_time = None
+        
+        # Processing components
+        self.vad = VoiceActivityDetector(
+            audio_config.sample_rate, 
+            audio_config.vad_aggressiveness
+        )
+        self.preprocessor = AudioPreprocessor(audio_config.sample_rate)
+        self.diarization = SpeakerDiarization(
+            audio_config.speaker_confidence_threshold,
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+        
+        # Plugin system
+        self.plugin_manager = PluginManager(plugin_config)
+        
+        # Buffers
+        buffer_size = int(audio_config.buffer_duration * audio_config.sample_rate / audio_config.chunk_size)
+        self.audio_buffer = CircularBuffer(buffer_size)
+        
+        # Threading
+        self.capture_thread = None
+        self.processing_thread = None
+        self.running = threading.Event()
+        
+        # Callbacks
+        self.callbacks: Dict[str, List[Callable]] = {
+            'audio_chunk': [],
+            'speaker_detected': [],
+            'device_changed': [],
+            'error': [],
+            'recording_started': [],
+            'recording_stopped': []
+        }
+        
+        self.logger = logging.getLogger(__name__)
+    
+    def _generate_session_id(self) -> str:
+        """Generate unique session ID"""
+        import uuid
+        return f"session_{int(time.time())}_{str(uuid.uuid4())[:8]}"
+    
+    def register_plugin(self, plugin: PluginInterface):
+        """Register a plugin with the audio system"""
+        self.plugin_manager.register_plugin(plugin)
+    
+    def enable_plugin(self, plugin_name: str):
+        """Enable a specific plugin"""
+        self.plugin_manager.enable_plugin(plugin_name)
+    
+    def disable_plugin(self, plugin_name: str):
+        """Disable a specific plugin"""
+        self.plugin_manager.disable_plugin(plugin_name)
+    
+    def get_available_devices(self) -> List[Dict[str, Any]]:
+        """Get list of available audio input devices"""
+        devices = []
+        
+        for i in range(self.pyaudio.get_device_count()):
+            device_info = self.pyaudio.get_device_info_by_index(i)
+            if device_info['maxInputChannels'] > 0:
+                devices.append({
+                    'index': i,
+                    'name': device_info['name'],
+                    'channels': device_info['maxInputChannels'],
+                    'sample_rate': device_info['defaultSampleRate']
+                })
+        
+        return devices
+    
+    def set_device(self, device_index: int):
+        """Change audio input device"""
+        was_recording = self.is_recording
+        
+        if was_recording:
+            self.stop_recording()
+        
+        self.audio_config.device_index = device_index
+        
+        if was_recording:
+            self.start_recording()
+        
+        self._trigger_callback('device_changed', device_index)
+    
+    def start_recording(self):
+        """Start audio capture and plugin processing"""
+        if self.is_recording:
+            return
+        
+        try:
+            # Generate new session ID
+            self.session_id = self._generate_session_id()
+            
+            # Open audio stream
+            self.stream = self.pyaudio.open(
+                format=self.audio_config.format,
+                channels=self.audio_config.channels,
+                rate=self.audio_config.sample_rate,
+                input=True,
+                input_device_index=self.audio_config.device_index,
+                frames_per_buffer=self.audio_config.chunk_size,
+                stream_callback=self._audio_callback
+            )
+            
+            self.is_recording = True
+            self.start_time = time.time()
+            self.running.set()
+            
+            # Start processing thread
+            self.processing_thread = threading.Thread(
+                target=self._processing_loop,
+                daemon=True,
+                name="AudioProcessing"
+            )
+            self.processing_thread.start()
+            
+            # Start plugin manager
+            self.plugin_manager.running.set()
+            
+            # Start audio stream
+            self.stream.start_stream()
+            
+            # Notify plugins
+            self.plugin_manager.notify_recording_started(self.session_id)
+            self._trigger_callback('recording_started', self.session_id)
+            
+            self.logger.info(f"Audio recording started - Session: {self.session_id}")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to start recording: {e}")
+            self._trigger_callback('error', e)
+            raise
+    
+    def stop_recording(self):
+        """Stop audio capture and plugin processing"""
+        if not self.is_recording:
+            return
+        
+        self.is_recording = False
+        self.running.clear()
+        
+        # Stop audio stream
+        if self.stream:
+            self.stream.stop_stream()
+            self.stream.close()
+            self.stream = None
+        
+        # Stop processing thread
+        if self.processing_thread and self.processing_thread.is_alive():
+            self.processing_thread.join(timeout=2.0)
+        
+        # Notify plugins
+        self.plugin_manager.notify_recording_stopped(self.session_id)
+        self._trigger_callback('recording_stopped', self.session_id)
+        
+        self.logger.info(f"Audio recording stopped - Session: {self.session_id}")
+    
+    def pause_recording(self):
+        """Pause audio capture"""
+        self.is_paused = True
+        if self.stream:
+            self.stream.stop_stream()
+    
+    def resume_recording(self):
+        """Resume audio capture"""
+        self.is_paused = False
+        if self.stream:
+            self.stream.start_stream()
+    
+    def _audio_callback(self, in_data, frame_count, time_info, status):
+        """PyAudio callback for captured audio data"""
+        if status:
+            self.logger.warning(f"Audio callback status: {status}")
+        
+        if not self.is_paused:
+            # Convert to numpy array
+            audio_data = np.frombuffer(in_data, dtype=np.int16)
+            
+            # Create audio chunk
+            chunk = AudioChunk(
+                data=audio_data.astype(np.float32) / 32768.0,  # Normalize to [-1, 1]
+                timestamp=time.time(),
+                sample_rate=self.audio_config.sample_rate,
+                session_id=self.session_id
+            )
+            
+            self.audio_buffer.append(chunk)
+        
+        return (None, pyaudio.paContinue)
+    
+    def _processing_loop(self):
+        """Main processing loop running in separate thread"""
+        self.logger.info("Audio processing loop started")
+        
+        while self.running.is_set():
+            try:
+                # Get recent audio chunks
+                recent_chunks = self.audio_buffer.get_recent(5)
+                
+                if not recent_chunks:
+                    time.sleep(0.01)
+                    continue
+                
+                # Process most recent chunk
+                chunk = recent_chunks[-1]
+                
+                # Voice activity detection
+                is_speech, vad_confidence = self.vad.is_speech(chunk.data)
+                chunk.is_speech = is_speech
+                chunk.voice_activity_score = vad_confidence
+                
+                if is_speech:
+                    # Preprocess audio
+                    processed_audio = self.preprocessor.process(
+                        chunk.data,
+                        self.audio_config.noise_reduction,
+                        self.audio_config.auto_gain_control
+                    )
+                    
+                    # Speaker diarization
+                    speaker_id, speaker_confidence = self.diarization.process_audio_chunk(
+                        processed_audio,
+                        chunk.timestamp,
+                        chunk.sample_rate
+                    )
+                    
+                    # Update chunk with speaker info
+                    chunk.data = processed_audio
+                    chunk.speaker_id = speaker_id
+                    chunk.confidence = speaker_confidence
+                    
+                    # Check if new speaker
+                    if speaker_id not in [c.speaker_id for c in recent_chunks[:-1] if c.speaker_id]:
+                        self.plugin_manager.notify_speaker_detected(speaker_id, self.session_id)
+                        self._trigger_callback('speaker_detected', speaker_id)
+                    
+                    # Distribute to plugins
+                    self.plugin_manager.distribute_audio(chunk)
+                    
+                    # Trigger callbacks
+                    self._trigger_callback('audio_chunk', chunk)
+                
+                time.sleep(0.001)  # Small delay to prevent busy waiting
+                
+            except Exception as e:
+                self.logger.error(f"Processing loop error: {e}")
+                self._trigger_callback('error', e)
+                time.sleep(0.1)
+        
+        self.logger.info("Audio processing loop stopped")
+    
+    def add_callback(self, event_type: str, callback: Callable):
+        """Add event callback"""
+        if event_type in self.callbacks:
+            self.callbacks[event_type].append(callback)
+    
+    def remove_callback(self, event_type: str, callback: Callable):
+        """Remove event callback"""
+        if event_type in self.callbacks and callback in self.callbacks[event_type]:
+            self.callbacks[event_type].remove(callback)
+    
+    def _trigger_callback(self, event_type: str, data: Any):
+        """Trigger callbacks for an event"""
+        for callback in self.callbacks.get(event_type, []):
+            try:
+                callback(data)
+            except Exception as e:
+                self.logger.error(f"Callback error for {event_type}: {e}")
+    
+    def get_statistics(self) -> Dict[str, Any]:
+        """Get current system statistics"""
+        plugin_stats = self.plugin_manager.get_performance_stats()
+        
+        return {
+            'session_id': self.session_id,
+            'is_recording': self.is_recording,
+            'is_paused': self.is_paused,
+            'recording_duration': time.time() - self.start_time if self.start_time else 0,
+            'buffer_size': len(self.audio_buffer.buffer),
+            'speakers_detected': len(self.diarization.speakers),
+            'speakers': {
+                sid: {
+                    'total_speech_time': info['total_speech_time'],
+                    'confidence': info['confidence'],
+                    'first_seen': info['first_seen'],
+                    'last_seen': info['last_seen']
+                }
+                for sid, info in self.diarization.speakers.items()
+            },
+            'plugins': plugin_stats
+        }
+    
+    def cleanup(self):
+        """Clean up resources"""
+        self.stop_recording()
+        self.plugin_manager.cleanup()
+        if self.pyaudio:
+            self.pyaudio.terminate()
+
+
+class ConfigManager:
+    """Manages configuration loading and plugin settings"""
+    
+    def __init__(self, config_path: str = "config/core_config.yaml", 
+                 plugin_config_path: str = "config/plugins_config.yaml"):
+        self.config_path = config_path
+        self.plugin_config_path = plugin_config_path
+        self.logger = logging.getLogger(__name__)
+    
+    def load_audio_config(self) -> AudioConfig:
+        """Load audio configuration from YAML file"""
+        try:
+            with open(self.config_path, 'r') as f:
+                config_dict = yaml.safe_load(f)
+            
+            audio_dict = config_dict.get('audio', {})
+            return AudioConfig(**audio_dict)
+        
+        except FileNotFoundError:
+            self.logger.warning(f"Config file not found: {self.config_path}, using defaults")
+            return AudioConfig()
+        except Exception as e:
+            self.logger.error(f"Error loading audio config: {e}")
+            return AudioConfig()
+    
+    def load_plugin_config(self) -> PluginConfig:
+        """Load plugin configuration from YAML file"""
+        try:
+            with open(self.plugin_config_path, 'r') as f:
+                config_dict = yaml.safe_load(f)
+            
+            plugin_dict = config_dict.get('plugin_distribution', {})
+            return PluginConfig(**plugin_dict)
+        
+        except FileNotFoundError:
+            self.logger.warning(f"Plugin config file not found: {self.plugin_config_path}, using defaults")
+            return PluginConfig()
+        except Exception as e:
+            self.logger.error(f"Error loading plugin config: {e}")
+            return PluginConfig()
+    
+    def get_plugin_settings(self) -> Dict[str, dict]:
+        """Get plugin enable/disable settings"""
+        try:
+            with open(self.plugin_config_path, 'r') as f:
+                config_dict = yaml.safe_load(f)
+            
+            return config_dict.get('plugins', {})
+        
+        except FileNotFoundError:
+            return {}
+        except Exception as e:
+            self.logger.error(f"Error loading plugin settings: {e}")
+            return {}
+    
+    def save_plugin_settings(self, plugin_settings: Dict[str, dict]):
+        """Save plugin settings to configuration file"""
+        try:
+            # Load existing config
+            try:
+                with open(self.plugin_config_path, 'r') as f:
+                    config_dict = yaml.safe_load(f) or {}
+            except FileNotFoundError:
+                config_dict = {}
+            
+            # Update plugin settings
+            config_dict['plugins'] = plugin_settings
+            
+            # Save back to file
+            with open(self.plugin_config_path, 'w') as f:
+                yaml.safe_dump(config_dict, f, default_flow_style=False)
+            
+            self.logger.info("Plugin settings saved")
+            
+        except Exception as e:
+            self.logger.error(f"Error saving plugin settings: {e}")
+
+
+# Factory functions
+def create_core_audio_recorder(config_manager: ConfigManager = None) -> CoreAudioRecorder:
+    """Create core audio recorder with configuration"""
+    if config_manager is None:
+        config_manager = ConfigManager()
+    
+    audio_config = config_manager.load_audio_config()
+    plugin_config = config_manager.load_plugin_config()
+    
+    return CoreAudioRecorder(audio_config, plugin_config)
+
+
+def load_audio_config_from_file(config_path: str) -> AudioConfig:
+    """Load audio configuration from specific file"""
+    config_manager = ConfigManager(config_path=config_path)
+    return config_manager.load_audio_config()
+
+
+if __name__ == "__main__":
+    # Example usage and testing
+    logging.basicConfig(level=logging.INFO)
+    
+    # Create config manager
+    config_manager = ConfigManager()
+    
+    # Create core audio recorder
+    recorder = create_core_audio_recorder(config_manager)
+    
+    # Example plugin implementation for testing
+    class TestPlugin:
+        def __init__(self, name: str):
+            self._name = name
+            self._enabled = True
+            self.chunks_received = 0
+        
+        @property
+        def name(self) -> str:
+            return self._name
+        
+        @property
+        def enabled(self) -> bool:
+            return self._enabled
+        
+        def process_audio(self, chunk: AudioChunk) -> Optional[AudioChunk]:
+            self.chunks_received += 1
+            print(f"Plugin {self.name}: Received chunk {chunk.chunk_sequence} "
+                  f"from speaker {chunk.speaker_id} (speech: {chunk.is_speech})")
+            return chunk
+        
+        def on_recording_started(self, session_id: str) -> None:
+            print(f"Plugin {self.name}: Recording started - {session_id}")
+        
+        def on_recording_stopped(self, session_id: str) -> None:
+            print(f"Plugin {self.name}: Recording stopped - {session_id}")
+        
+        def on_speaker_detected(self, speaker_id: str, session_id: str) -> None:
+            print(f"Plugin {self.name}: New speaker detected - {speaker_id}")
+        
+        def cleanup(self) -> None:
+            print(f"Plugin {self.name}: Cleaned up")
+    
+    # Register test plugins
+    test_plugin1 = TestPlugin("TestConsent")
+    test_plugin2 = TestPlugin("TestEncryption")
+    test_plugin3 = TestPlugin("TestTranscription")
+    
+    recorder.register_plugin(test_plugin1)
+    recorder.register_plugin(test_plugin2)
+    recorder.register_plugin(test_plugin3)
+    
+    # List available devices
+    devices = recorder.get_available_devices()
+    print("Available audio devices:")
+    for device in devices:
+        print(f"  {device['index']}: {device['name']}")
+    
+    # Set up callbacks
+    def on_audio_chunk(chunk):
+        print(f"Main: Audio chunk from speaker {chunk.speaker_id} "
+              f"(confidence: {chunk.confidence:.2f}, speech: {chunk.is_speech})")
+    
+    def on_speaker_detected(speaker_id):
+        print(f"Main: New speaker detected: {speaker_id}")
+    
+    def on_recording_started(session_id):
+        print(f"Main: Recording started - {session_id}")
+    
+    def on_recording_stopped(session_id):
+        print(f"Main: Recording stopped - {session_id}")
+    
+    recorder.add_callback('audio_chunk', on_audio_chunk)
+    recorder.add_callback('speaker_detected', on_speaker_detected)
+    recorder.add_callback('recording_started', on_recording_started)
+    recorder.add_callback('recording_stopped', on_recording_stopped)
+    
+    try:
+        # Start recording
+        recorder.start_recording()
+        print("Recording started. Press Enter to stop...")
+        input()
+        
+        # Get statistics
+        stats = recorder.get_statistics()
+        print(f"\nRecording Statistics:")
+        print(f"Session ID: {stats['session_id']}")
+        print(f"Duration: {stats['recording_duration']:.1f}s")
+        print(f"Speakers detected: {stats['speakers_detected']}")
+        print(f"Plugin performance:")
+        for plugin_name, plugin_stats in stats['plugins'].items():
+            print(f"  {plugin_name}: {plugin_stats['chunks_processed']} chunks, "
+                  f"avg latency: {plugin_stats['average_latency_ms']:.1f}ms")
+        
+        # Test plugin disable/enable
+        print("\nTesting plugin disable/enable...")
+        recorder.disable_plugin("TestEncryption")
+        time.sleep(2)
+        recorder.enable_plugin("TestEncryption")
+        time.sleep(2)
+        
+    finally:
+        recorder.cleanup()
+        print("Core audio recorder cleaned up")
+def get_statistics(self) -> Dict[str, Any]:
+        """Get current system statistics"""
+        plugin_stats = self.plugin_manager.get_performance_stats()
+        
+        return {
+            'session_id': self.session_id,
+            'is_recording': self.is_recording,
+            'is_paused': self.is_paused,
+            'recording_duration': time.time() - self.start_time if self.start_time else 0,
+            'buffer_size': len(self.audio_buffer.buffer),
+            'speakers_detected': len(self.diarization.speakers),
+            'speakers': {
+                sid: {
+                    'total_speech_time': info['total_speech_time'],
+                    'confidence': info['confidence'],
+                    'first_seen': info['first_seen'],
+                    'last_seen': info['last_seen']
+                }
+                for sid, info in self.diarization.speakers.items()
+            },
+            'plugins': plugin_stats
+        }
+    
+    def cleanup(self):
+        """Clean up resources"""
+        self.stop_recording()
+        self.plugin_manager.cleanup()
+        if self.pyaudio:
+            self.pyaudio.terminate()
+
+
+class ConfigManager:
+    """Manages configuration loading and plugin settings"""
+    
+    def __init__(self, config_path: str = "config/core_config.yaml", 
+                 plugin_config_path: str = "config/plugins_config.yaml"):
+        self.config_path = config_path
+        self.plugin_config_path = plugin_config_path
+        self.logger = logging.getLogger(__name__)
+    
+    def load_audio_config(self) -> AudioConfig:
+        """Load audio configuration from YAML file"""
+        try:
+            with open(self.config_path, 'r') as f:
+                config_dict = yaml.safe_load(f)
+            
+            audio_dict = config_dict.get('audio', {})
+            return AudioConfig(**audio_dict)
+        
+        except FileNotFoundError:
+            self.logger.warning(f"Config file not found: {self.config_path}, using defaults")
+            return AudioConfig()
+        except Exception as e:
+            self.logger.error(f"Error loading audio config: {e}")
+            return AudioConfig()
+    
+    def load_plugin_config(self) -> PluginConfig:
+        """Load plugin configuration from YAML file"""
+        try:
+            with open(self.plugin_config_path, 'r') as f:
+                config_dict = yaml.safe_load(f)
+            
+            plugin_dict = config_dict.get('plugin_distribution', {})
+            return PluginConfig(**plugin_dict)
+        
+        except FileNotFoundError:
+            self.logger.warning(f"Plugin config file not found: {self.plugin_config_path}, using defaults")
+            return PluginConfig()
+        except Exception as e:
+            self.logger.error(f"Error loading plugin config: {e}")
+            return PluginConfig()
+    
+    def get_plugin_settings(self) -> Dict[str, dict]:
+        """Get plugin enable/disable settings"""
+        try:
+            with open(self.plugin_config_path, 'r') as f:
+                config_dict = yaml.safe_load(f)
+            
+            return config_dict.get('plugins', {})
+        
+        except FileNotFoundError:
+            return {}
+        except Exception as e:
+            self.logger.error(f"Error loading plugin settings: {e}")
+            return {}
+    
+    def save_plugin_settings(self, plugin_settings: Dict[str, dict]):
+        """Save plugin settings to configuration file"""
+        try:
+            # Load existing config
+            try:
+                with open(self.plugin_config_path, 'r') as f:
+                    config_dict = yaml.safe_load(f) or {}
+            except FileNotFoundError:
+                config_dict = {}
+            
+            # Update plugin settings
+            config_dict['plugins'] = plugin_settings
+            
+            # Save back to file
+            with open(self.plugin_config_path, 'w') as f:
+                yaml.safe_dump(config_dict, f, default_flow_style=False)
+            
+            self.logger.info("Plugin settings saved")
+            
+        except Exception as e:
+            self.logger.error(f"Error saving plugin settings: {e}")
+
+
+# Factory functions
+def create_core_audio_recorder(config_manager: ConfigManager = None) -> CoreAudioRecorder:
+    """Create core audio recorder with configuration"""
+    if config_manager is None:
+        config_manager = ConfigManager()
+    
+    audio_config = config_manager.load_audio_config()
+    plugin_config = config_manager.load_plugin_config()
+    
+    return CoreAudioRecorder(audio_config, plugin_config)
+
+
+def load_audio_config_from_file(config_path: str) -> AudioConfig:
+    """Load audio configuration from specific file"""
+    config_manager = ConfigManager(config_path=config_path)
+    return config_manager.load_audio_config()
+
+
+if __name__ == "__main__":
+    # Example usage and testing
+    logging.basicConfig(level=logging.INFO)
+    
+    # Create config manager
+    config_manager = ConfigManager()
+    
+    # Create core audio recorder
+    recorder = create_core_audio_recorder(config_manager)
+    
+    # Example plugin implementation for testing
+    class TestPlugin:
+        def __init__(self, name: str):
+            self._name = name
+            self._enabled = True
+            self.chunks_received = 0
+        
+        @property
+        def name(self) -> str:
+            return self._name
+        
+        @property
+        def enabled(self) -> bool:
+            return self._enabled
+        
+        def process_audio(self, chunk: AudioChunk) -> Optional[AudioChunk]:
+            self.chunks_received += 1
+            print(f"Plugin {self.name}: Received chunk {chunk.chunk_sequence} "
+                  f"from speaker {chunk.speaker_id} (speech: {chunk.is_speech})")
+            return chunk
+        
+        def on_recording_started(self, session_id: str) -> None:
+            print(f"Plugin {self.name}: Recording started - {session_id}")
+        
+        def on_recording_stopped(self, session_id: str) -> None:
+            print(f"Plugin {self.name}: Recording stopped - {session_id}")
+        
+        def on_speaker_detected(self, speaker_id: str, session_id: str) -> None:
+            print(f"Plugin {self.name}: New speaker detected - {speaker_id}")
+        
+        def cleanup(self) -> None:
+            print(f"Plugin {self.name}: Cleaned up")
+    
+    # Register test plugins
+    test_plugin1 = TestPlugin("TestConsent")
+    test_plugin2 = TestPlugin("TestEncryption")
+    test_plugin3 = TestPlugin("TestTranscription")
+    
+    recorder.register_plugin(test_plugin1)
+    recorder.register_plugin(test_plugin2)
+    recorder.register_plugin(test_plugin3)
+    
+    # List available devices
+    devices = recorder.get_available_devices()
+    print("Available audio devices:")
+    for device in devices:
+        print(f"  {device['index']}: {device['name']}")
+    
+    # Set up callbacks
+    def on_audio_chunk(chunk):
+        print(f"Main: Audio chunk from speaker {chunk.speaker_id} "
+              f"(confidence: {chunk.confidence:.2f}, speech: {chunk.is_speech})")
+    
+    def on_speaker_detected(speaker_id):
+        print(f"Main: New speaker detected: {speaker_id}")
+    
+    def on_recording_started(session_id):
+        print(f"Main: Recording started - {session_id}")
+    
+    def on_recording_stopped(session_id):
+        print(f"Main: Recording stopped - {session_id}")
+    
+    recorder.add_callback('audio_chunk', on_audio_chunk)
+    recorder.add_callback('speaker_detected', on_speaker_detected)
+    recorder.add_callback('recording_started', on_recording_started)
+    recorder.add_callback('recording_stopped', on_recording_stopped)
+    
+    try:
+        # Start recording
+        recorder.start_recording()
+        print("Recording started. Press Enter to stop...")
+        input()
+        
+        # Get statistics
+        stats = recorder.get_statistics()
+        print(f"\nRecording Statistics:")
+        print(f"Session ID: {stats['session_id']}")
+        print(f"Duration: {stats['recording_duration']:.1f}s")
+        print(f"Speakers detected: {stats['speakers_detected']}")
+        print(f"Plugin performance:")
+        for plugin_name, plugin_stats in stats['plugins'].items():
+            print(f"  {plugin_name}: {plugin_stats['chunks_processed']} chunks, "
+                  f"avg latency: {plugin_stats['average_latency_ms']:.1f}ms")
+        
+        # Test plugin disable/enable
+        print("\nTesting plugin disable/enable...")
+        recorder.disable_plugin("TestEncryption")
+        time.sleep(2)
+        recorder.enable_plugin("TestEncryption")
+        time.sleep(2)
+        
+    finally:
+        recorder.cleanup()
+        print("Core audio recorder cleaned up")
